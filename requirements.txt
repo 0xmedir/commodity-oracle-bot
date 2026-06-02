@@ -1,0 +1,8 @@
+pyTelegramBotAPI
+yfinance
+feedparser
+pandas
+numpy
+matplotlib
+vaderSentiment
+requests
