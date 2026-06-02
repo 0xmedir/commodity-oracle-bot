@@ -39,12 +39,12 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "613f0647c1904f35908015d3637fda26")
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "7458428092").split(",") if x.strip()]
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 MAX_ALERTS = 20
 MAX_HISTORY = 5
 PRICE_TTL = 60
 HIST_TTL = 300
-NEWS_TTL = 900   # 15 minutes
+NEWS_TTL = 900
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("CommodityOracle")
@@ -52,18 +52,19 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
-# ========== COMMODITIES – ALL YFINANCE FUTURES (RELIABLE) ==========
+# ========== COMMODITIES ==========
+# Metals use spot tickers (more accurate), others use futures
 COMMODITIES = {
-    "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
-    "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
-    "NATGAS":   {"symbol": "NG=F",  "name": "Natural Gas",      "unit": "USD/MMBtu", "emoji": "🔥",  "group": "energy"},
-    "GOLD":     {"symbol": "GC=F",  "name": "Gold",             "unit": "USD/oz",    "emoji": "🥇",  "group": "metals"},
-    "SILVER":   {"symbol": "SI=F",  "name": "Silver",           "unit": "USD/oz",    "emoji": "🥈",  "group": "metals"},
-    "COPPER":   {"symbol": "HG=F",  "name": "Copper",           "unit": "USD/lb",    "emoji": "🔶",  "group": "metals"},
-    "PLATINUM": {"symbol": "PL=F",  "name": "Platinum",         "unit": "USD/oz",    "emoji": "⚪",  "group": "metals"},
-    "WHEAT":    {"symbol": "ZW=F",  "name": "Wheat",            "unit": "USc/bu",    "emoji": "🌾",  "group": "agri"},
-    "CORN":     {"symbol": "ZC=F",  "name": "Corn",             "unit": "USc/bu",    "emoji": "🌽",  "group": "agri"},
-    "SOY":      {"symbol": "ZS=F",  "name": "Soybeans",         "unit": "USc/bu",    "emoji": "🫘",  "group": "agri"},
+    "WTI":      {"symbol": "CL=F",     "name": "WTI Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
+    "BRENT":    {"symbol": "BZ=F",     "name": "Brent Crude Oil", "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
+    "NATGAS":   {"symbol": "NG=F",     "name": "Natural Gas",     "unit": "USD/MMBtu", "emoji": "🔥",  "group": "energy"},
+    "GOLD":     {"symbol": "XAUUSD=X", "name": "Gold",            "unit": "USD/oz",    "emoji": "🥇",  "group": "metals"},
+    "SILVER":   {"symbol": "XAGUSD=X", "name": "Silver",          "unit": "USD/oz",    "emoji": "🥈",  "group": "metals"},
+    "COPPER":   {"symbol": "XCUUSD=X", "name": "Copper",          "unit": "USD/lb",    "emoji": "🔶",  "group": "metals"},
+    "PLATINUM": {"symbol": "XPTUSD=X", "name": "Platinum",        "unit": "USD/oz",    "emoji": "⚪",  "group": "metals"},
+    "WHEAT":    {"symbol": "ZW=F",     "name": "Wheat",           "unit": "USc/bu",    "emoji": "🌾",  "group": "agri"},
+    "CORN":     {"symbol": "ZC=F",     "name": "Corn",            "unit": "USc/bu",    "emoji": "🌽",  "group": "agri"},
+    "SOY":      {"symbol": "ZS=F",     "name": "Soybeans",        "unit": "USc/bu",    "emoji": "🫘",  "group": "agri"},
 }
 
 GROUPS = {
@@ -72,33 +73,33 @@ GROUPS = {
     "agri":   ("🌱 Agriculture", ["WHEAT", "CORN", "SOY"]),
 }
 
-# Keywords for RSS fallback (if NewsAPI fails)
 KEYWORDS = {
     "WTI": ["crude oil", "wti", "opec", "petroleum", "barrel", "oil price", "energy market"],
-    "BRENT": ["brent", "crude oil", "opec", "petroleum", "barrel", "oil price"],
-    "NATGAS": ["natural gas", "lng", "henry hub", "gas price", "gas supply"],
-    "GOLD": ["gold", "bullion", "xau", "fed rate", "inflation", "precious metal", "safe haven"],
-    "SILVER": ["silver", "xag", "precious metal", "silver price"],
-    "COPPER": ["copper", "base metal", "china demand", "manufacturing pmi"],
-    "PLATINUM": ["platinum", "pgm", "catalytic"],
-    "WHEAT": ["wheat", "grain", "ukraine", "russia", "food supply", "crop"],
-    "CORN": ["corn", "maize", "ethanol", "grain", "crop"],
-    "SOY": ["soybean", "soy", "oilseed", "china soy"],
+    "BRENT": ["brent", "crude oil", "opec", "petroleum", "barrel"],
+    "NATGAS": ["natural gas", "lng", "henry hub", "gas price"],
+    "GOLD": ["gold", "bullion", "xau", "fed rate", "inflation", "precious metal"],
+    "SILVER": ["silver", "xag", "precious metal"],
+    "COPPER": ["copper", "base metal", "china demand"],
+    "PLATINUM": ["platinum", "pgm"],
+    "WHEAT": ["wheat", "grain", "ukraine", "food supply"],
+    "CORN": ["corn", "maize", "ethanol"],
+    "SOY": ["soybean", "soy", "oilseed"],
 }
 
-# Fallback RSS feeds (used only if NewsAPI fails)
 RSS_FEEDS = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://finance.yahoo.com/rss/topfinstories",
     "https://www.marketwatch.com/rss/marketpulse",
 ]
 
+# 1D added with 30m candles (more reliable than 5m)
 TIMEFRAMES = {
-    "5D": ("5d", "1h"),
-    "1M": ("1mo", "1d"),
-    "3M": ("3mo", "1d"),
-    "6M": ("6mo", "1d"),
-    "1Y": ("1y", "1wk"),
+    "1D":  ("1d",  "30m"),
+    "5D":  ("5d",  "1h"),
+    "1M":  ("1mo", "1d"),
+    "3M":  ("3mo", "1d"),
+    "6M":  ("6mo", "1d"),
+    "1Y":  ("1y",  "1wk"),
 }
 
 # ========== DATABASE ==========
@@ -126,8 +127,15 @@ db_query("""CREATE TABLE IF NOT EXISTS alerts (
 )""")
 db_query("""CREATE TABLE IF NOT EXISTS profiles (
     user_id INTEGER PRIMARY KEY,
-    join_date INTEGER, username TEXT, first_name TEXT
+    join_date INTEGER, username TEXT, first_name TEXT,
+    is_admin INTEGER DEFAULT 0
 )""")
+
+# Mark admins from env as admin in DB
+def init_admins():
+    for uid in ADMIN_IDS:
+        db_query("UPDATE profiles SET is_admin=1 WHERE user_id=?", (uid,))
+init_admins()
 
 # ========== CACHE ==========
 class TTLCache:
@@ -157,42 +165,64 @@ def fmt_price(p):
     if p >= 1:    return f"${p:,.4f}"
     return f"${p:.6f}"
 
-def is_admin(uid): return uid in ADMIN_IDS
+def is_admin(uid):
+    if uid in ADMIN_IDS:
+        return True
+    row = db_query("SELECT is_admin FROM profiles WHERE user_id=?", (uid,), fetch_one=True)
+    return row and row[0] == 1
 
 def delete_msg(m):
-    try: bot.delete_message(m.chat.id, m.message_id)
-    except: pass
+    try:
+        bot.delete_message(m.chat.id, m.message_id)
+    except:
+        pass
 
 def safe_send(cid, text, markup=None):
+    """Send message with HTML fallback to plain text on parse errors."""
     try:
-        return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True)
+        return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True, parse_mode="HTML")
     except ApiTelegramException as e:
-        log.error(f"send error {cid}: {e}"); return None
+        if "can't parse entities" in str(e):
+            try:
+                return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True, parse_mode=None)
+            except Exception as e2:
+                log.error(f"send error (plain) {cid}: {e2}")
+                return None
+        else:
+            log.error(f"send error {cid}: {e}")
+            return None
     except Exception as e:
-        log.error(f"send error: {e}"); return None
+        log.error(f"send error: {e}")
+        return None
 
 def safe_edit(cid, mid, text, markup=None):
     try:
         bot.edit_message_text(text, cid, mid, parse_mode="HTML", reply_markup=markup)
         return True
     except ApiTelegramException as e:
-        if "message is not modified" in str(e): return True
-        log.warning(f"edit error: {e}"); return False
+        if "message is not modified" in str(e):
+            return True
+        log.warning(f"edit error: {e}")
+        return False
     except Exception as e:
-        log.warning(f"edit error: {e}"); return False
+        log.warning(f"edit error: {e}")
+        return False
 
 msg_queue = {}
 q_lock = threading.RLock()
 
 def send_and_track(cid, text, markup=None):
     sent = safe_send(cid, text, markup)
-    if not sent: return None
+    if not sent:
+        return None
     with q_lock:
         msg_queue.setdefault(cid, []).append(sent.message_id)
         while len(msg_queue[cid]) > MAX_HISTORY:
             old = msg_queue[cid].pop(0)
-            try: bot.delete_message(cid, old)
-            except: pass
+            try:
+                bot.delete_message(cid, old)
+            except:
+                pass
     return sent
 
 def back_button():
@@ -258,14 +288,13 @@ def get_history(key, period="1mo", interval="1d"):
         cache.set(ck, df, ttl=HIST_TTL)
     return df
 
-# ========== NEWS FETCHING (NEWSAPI + RSS FALLBACK) ==========
+# ========== NEWS FETCHING ==========
 def fetch_news(key, max_items=6):
     ck = f"news_{key}"
     cached = cache.get(ck)
     if cached is not None:
         return cached
 
-    # Map commodity key to NewsAPI query keywords
     query_map = {
         "WTI": "crude oil WTI",
         "BRENT": "Brent crude oil",
@@ -281,7 +310,6 @@ def fetch_news(key, max_items=6):
     query = query_map.get(key, COMMODITIES[key]["name"])
     articles = []
 
-    # Try NewsAPI (always if key exists)
     if NEWS_API_KEY and NEWS_API_KEY.strip():
         try:
             url = "https://newsapi.org/v2/everything"
@@ -308,7 +336,6 @@ def fetch_news(key, max_items=6):
         except Exception as e:
             log.warning(f"NewsAPI exception: {e}")
 
-    # Fallback to RSS if NewsAPI returned nothing
     if not articles:
         keywords = KEYWORDS.get(key, [])
         for url in RSS_FEEDS:
@@ -447,30 +474,25 @@ def generate_signal(ta, sentiment=0.0):
     else:
         reasons.append(f"⚪ News sentiment neutral ({sentiment:+.2f})")
 
-    if score >= 3:
-        sig = "🟢 STRONG BUY"
-    elif score >= 1:
-        sig = "🟡 BUY"
-    elif score <= -3:
-        sig = "🔴 STRONG SELL"
-    elif score <= -1:
-        sig = "🟠 SELL"
-    else:
-        sig = "⚪ HOLD"
+    if score >= 3: sig = "🟢 STRONG BUY"
+    elif score >= 1: sig = "🟡 BUY"
+    elif score <= -3: sig = "🔴 STRONG SELL"
+    elif score <= -1: sig = "🟠 SELL"
+    else: sig = "⚪ HOLD"
 
     return sig, reasons, score
 
-# ========== CHART GENERATION ==========
-BG = "#0d1117"
-GRID = "#21262d"
-TEXT = "#e6edf3"
-MUTED = "#8b949e"
-BLUE = "#58a6ff"
-GREEN = "#3fb950"
-RED = "#f85149"
+# ========== CHART GENERATION with current price annotation ==========
+BG     = "#0d1117"
+GRID   = "#21262d"
+TEXT   = "#e6edf3"
+MUTED  = "#8b949e"
+BLUE   = "#58a6ff"
+GREEN  = "#3fb950"
+RED    = "#f85149"
 ORANGE = "#f97316"
 PURPLE = "#a371f7"
-SPINE = "#30363d"
+SPINE  = "#30363d"
 
 def _style_ax(ax):
     ax.set_facecolor(BG)
@@ -481,40 +503,46 @@ def _style_ax(ax):
 
 def generate_chart(key, period="1mo", interval="1d"):
     df = get_history(key, period, interval)
-    if df is None or df.empty or len(df) < 5: return None
+    if df is None or df.empty or len(df) < 5:
+        return None
 
     c = COMMODITIES[key]
     cl = df["Close"].values.astype(float)
-    op = df["Open"].values.astype(float) if "Open" in df.columns else cl.copy()
-    hi = df["High"].values.astype(float) if "High" in df.columns else cl.copy()
-    lo = df["Low"].values.astype(float) if "Low" in df.columns else cl.copy()
+    op = df["Open"].values.astype(float)  if "Open"   in df.columns else cl.copy()
+    hi = df["High"].values.astype(float)  if "High"   in df.columns else cl.copy()
+    lo = df["Low"].values.astype(float)   if "Low"    in df.columns else cl.copy()
     vol = df["Volume"].values.astype(float) if "Volume" in df.columns else np.zeros(len(df))
 
     n = len(df)
     x = np.arange(n)
     up = cl >= op
 
-    cs = pd.Series(cl)
-    delta = cs.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi_s = 100 - 100 / (1 + rs)
-    ema20 = cs.ewm(span=20, adjust=False).mean().values
-    bb_mid = cs.rolling(20).mean()
-    bb_std = cs.rolling(20).std()
+    # Indicators
+    cs      = pd.Series(cl)
+    delta   = cs.diff()
+    gain    = delta.clip(lower=0).rolling(14).mean()
+    loss    = (-delta.clip(upper=0)).rolling(14).mean()
+    rs      = gain / loss.replace(0, np.nan)
+    rsi_s   = 100 - 100 / (1 + rs)
+    ema20   = cs.ewm(span=20, adjust=False).mean().values
+    bb_mid  = cs.rolling(20).mean()
+    bb_std  = cs.rolling(20).std()
     bb_up_v = (bb_mid + 2 * bb_std).values
     bb_lo_v = (bb_mid - 2 * bb_std).values
 
+    last_price = cl[-1]
+    last_date = df.index[-1]
+
     fig = plt.figure(figsize=(13, 9), facecolor=BG)
-    gs = fig.add_gridspec(3, 1, height_ratios=[4, 1, 2], hspace=0.06)
+    gs  = fig.add_gridspec(3, 1, height_ratios=[4, 1, 2], hspace=0.06)
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
     for ax in [ax1, ax2, ax3]:
         _style_ax(ax)
 
-    up_i = np.where(up)[0]; dn_i = np.where(~up)[0]
+    # Candles
+    up_i = np.where(up)[0];  dn_i = np.where(~up)[0]
     ax1.bar(up_i, np.abs(cl[up_i] - op[up_i]),
             bottom=np.minimum(op[up_i], cl[up_i]),
             color=GREEN, width=0.65, linewidth=0)
@@ -522,20 +550,26 @@ def generate_chart(key, period="1mo", interval="1d"):
             bottom=np.minimum(op[dn_i], cl[dn_i]),
             color=RED, width=0.65, linewidth=0)
     ax1.vlines(up_i, lo[up_i], hi[up_i], color=GREEN, linewidth=0.8)
-    ax1.vlines(dn_i, lo[dn_i], hi[dn_i], color=RED, linewidth=0.8)
+    ax1.vlines(dn_i, lo[dn_i], hi[dn_i], color=RED,   linewidth=0.8)
 
-    ax1.plot(x, ema20, color=ORANGE, linewidth=1.2, label="EMA20", alpha=0.9)
+    # EMA & BB
+    ax1.plot(x, ema20,   color=ORANGE, linewidth=1.2, label="EMA20", alpha=0.9)
     ax1.fill_between(x, bb_up_v, bb_lo_v, alpha=0.08, color=BLUE)
     ax1.plot(x, bb_up_v, color=BLUE, linewidth=0.7, linestyle="--", alpha=0.6, label="BB±2σ")
     ax1.plot(x, bb_lo_v, color=BLUE, linewidth=0.7, linestyle="--", alpha=0.6)
 
-    ax1.set_title(f"{c['emoji']}  {c['name']} — {period}  ({interval} candles)",
+    # Current price line + label
+    ax1.axhline(y=last_price, color="cyan", linestyle="-.", linewidth=1.5, alpha=0.8, label=f"Current: {fmt_price(last_price)}")
+    ax1.text(n-1, last_price, f" {fmt_price(last_price)}", color="cyan", fontsize=9, va="bottom", ha="left")
+
+    ax1.set_title(f"{c['emoji']}  {c['name']} — {period}  ({interval} candles) | Last: {fmt_price(last_price)}",
                   color=TEXT, fontsize=13, pad=8)
     ax1.set_ylabel(c["unit"], color=MUTED, fontsize=9)
     ax1.legend(facecolor="#161b22", labelcolor=TEXT, fontsize=8,
                loc="upper left", framealpha=0.7)
     ax1.tick_params(labelbottom=False)
 
+    # Volume
     vol_c = np.where(up, GREEN, RED)
     ax2.bar(x, vol, color=vol_c, width=0.65, alpha=0.65)
     ax2.set_ylabel("Volume", color=MUTED, fontsize=8)
@@ -543,10 +577,11 @@ def generate_chart(key, period="1mo", interval="1d"):
     if vol.max() > 0:
         ax2.set_ylim(0, vol.max() * 1.3)
 
+    # RSI
     ax3.plot(x, rsi_s, color=PURPLE, linewidth=1.3)
-    ax3.axhline(70, color=RED, linewidth=0.8, linestyle="--", alpha=0.7)
+    ax3.axhline(70, color=RED,   linewidth=0.8, linestyle="--", alpha=0.7)
     ax3.axhline(30, color=GREEN, linewidth=0.8, linestyle="--", alpha=0.7)
-    ax3.axhline(50, color=MUTED, linewidth=0.5, linestyle=":", alpha=0.5)
+    ax3.axhline(50, color=MUTED, linewidth=0.5, linestyle=":",  alpha=0.5)
     ax3.fill_between(x, rsi_s, 70, where=(rsi_s >= 70), alpha=0.15, color=RED)
     ax3.fill_between(x, rsi_s, 30, where=(rsi_s <= 30), alpha=0.15, color=GREEN)
     ax3.set_ylabel("RSI(14)", color=MUTED, fontsize=8)
@@ -555,9 +590,9 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax3.text(n - 1, last_rsi + 2, f"{last_rsi:.0f}",
              color=PURPLE, fontsize=7, ha="right")
 
-    step = max(1, n // 8)
-    ticks = list(range(0, n, step))
-    fmt = "%b %y" if period == "1y" else "%m/%d"
+    step   = max(1, n // 8)
+    ticks  = list(range(0, n, step))
+    fmt    = "%b %y" if period == "1y" else "%m/%d"
     labels = [df.index[i].strftime(fmt) for i in ticks]
     ax3.set_xticks(ticks)
     ax3.set_xticklabels(labels, rotation=25, ha="right", fontsize=7, color=MUTED)
@@ -572,7 +607,7 @@ def generate_chart(key, period="1mo", interval="1d"):
     buf.seek(0)
     return buf
 
-# ========== PRICE ALERTS ==========
+# ========== ALERTS ==========
 def add_alert(uid, cid, commodity, target, direction):
     cnt = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND user_id=?", (uid,), fetch_one=True)[0]
     if cnt >= MAX_ALERTS:
@@ -744,16 +779,28 @@ def cmd_prices(m):
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        safe_send(m.chat.id, "⛔ Admin only command.")
+        return
     delete_msg(m)
     users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     triggered = db_query("SELECT COUNT(*) FROM alerts WHERE active=0", fetch_one=True)[0]
-    safe_send(m.chat.id, f"📊 <b>Bot Stats</b>\n\nUsers: {users}\nActive alerts: {active}\nTriggered: {triggered}")
+    # Most active commodity
+    row = db_query("SELECT commodity, COUNT(*) as cnt FROM alerts WHERE active=1 GROUP BY commodity ORDER BY cnt DESC LIMIT 1", fetch_one=True)
+    most_active = f"{row[0]} ({row[1]} alerts)" if row else "None"
+    safe_send(m.chat.id,
+        f"📊 <b>Bot Stats</b>\n\n"
+        f"👥 Total users: {users}\n"
+        f"🔔 Active alerts: {active}\n"
+        f"✅ Triggered alerts: {triggered}\n"
+        f"🔥 Most active commodity: {most_active}")
 
 @bot.message_handler(commands=["broadcast"])
 def cmd_broadcast(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id):
+        safe_send(m.chat.id, "⛔ Admin only command.")
+        return
     delete_msg(m)
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -769,6 +816,10 @@ def cmd_broadcast(m):
     safe_send(m.chat.id, f"✅ Sent: {sent}  ❌ Failed: {failed}")
 
 # ========== CALLBACK HANDLERS ==========
+@bot.callback_query_handler(func=lambda call: True)
+def debug_callback(call):
+    log.info(f"Callback received: {call.data} from {call.from_user.id}")
+
 @bot.callback_query_handler(func=lambda c: c.data == "back_main")
 def cb_back(call):
     with wait_lock:
@@ -866,100 +917,125 @@ def cb_nws(call):
     bot.answer_callback_query(call.id)
     loading = send_and_track(cid, f"⏳ Fetching {key} news…", back_button())
     def fetch():
-        articles = fetch_news(key)
-        avg, label = sentiment_score(articles)
-        c = COMMODITIES[key]
-        text = f"📰 <b>{c['emoji']} {c['name']} — News & Sentiment</b>\n\n"
-        text += f"📊 Overall: <b>{label}</b>  ({avg:+.2f})\n"
-        if VADER_OK:
-            bar = "█" * int(abs(avg) * 10) or "░"
-            text += f"{'▶' if avg >= 0 else '◀'} {bar}\n"
-        text += "\n"
-        if articles:
-            for i, a in enumerate(articles[:6], 1):
-                em = headline_emoji(a["title"])
-                title = h(a["title"][:110])
-                text += f"{em} <b>{i}.</b> {title}\n"
-                if a["link"]:
-                    text += f"   <a href='{h(a['link'])}'>Read →</a>\n"
-                text += "\n"
-        else:
-            text += "<i>No recent headlines found. Try again later.</i>\n"
-        text += "<i>Source: NewsAPI, Reuters, Yahoo Finance, MarketWatch</i>"
-        if loading:
-            try: bot.delete_message(cid, loading.message_id)
-            except: pass
-        kb = InlineKeyboardMarkup()
-        kb.row(
-            InlineKeyboardButton("🎯 Get Signal", callback_data=f"sig_{key}"),
-            InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
-        )
-        send_and_track(cid, text, kb)
+        try:
+            articles = fetch_news(key)
+            avg, label = sentiment_score(articles)
+            c = COMMODITIES[key]
+            text = f"📰 <b>{c['emoji']} {c['name']} — News & Sentiment</b>\n\n"
+            text += f"📊 Overall: <b>{label}</b>  ({avg:+.2f})\n"
+            if VADER_OK:
+                bar = "█" * int(abs(avg) * 10) or "░"
+                text += f"{'▶' if avg >= 0 else '◀'} {bar}\n"
+            text += "\n"
+            if articles:
+                for i, a in enumerate(articles[:6], 1):
+                    em = headline_emoji(a["title"])
+                    title = h(a["title"][:110])
+                    text += f"{em} <b>{i}.</b> {title}\n"
+                    if a["link"]:
+                        text += f"   <a href='{h(a['link'])}'>Read →</a>\n"
+                    text += "\n"
+            else:
+                text += "<i>No recent headlines found. Try again later.</i>\n"
+            text += "<i>Source: NewsAPI, Reuters, Yahoo Finance, MarketWatch</i>"
+            if loading:
+                try: bot.delete_message(cid, loading.message_id)
+                except: pass
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🎯 Get Signal", callback_data=f"sig_{key}"),
+                InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+            )
+            send_and_track(cid, text, kb)
+        except Exception as e:
+            log.error(f"News fetch error: {e}")
+            if loading:
+                try: bot.delete_message(cid, loading.message_id)
+                except: pass
+            safe_send(cid, "❌ Error fetching news. Try again later.", back_button())
     threading.Thread(target=fetch, daemon=True).start()
 
 @bot.callback_query_handler(func=lambda c: c.data == "sig_menu")
 def cb_sig_menu(call):
-    text, kb = commodity_picker("sig_", "🎯 <b>Trading Signal</b>",
-                                "RSI · MACD · Bollinger · EMA · Sentiment combined.")
-    send_and_track(call.message.chat.id, text, kb)
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+        text, kb = commodity_picker("sig_", "🎯 <b>Trading Signal</b>",
+                                    "RSI · MACD · Bollinger · EMA · Sentiment combined.")
+        send_and_track(call.message.chat.id, text, kb)
+    except Exception as e:
+        log.error(f"Error in cb_sig_menu: {e}")
+        bot.answer_callback_query(call.id, "Error", show_alert=False)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sig_") and c.data != "sig_menu")
 def cb_sig(call):
-    key = call.data[len("sig_"):]
-    if key not in COMMODITIES:
-        bot.answer_callback_query(call.id, "Unknown"); return
-    cid = call.message.chat.id
-    bot.answer_callback_query(call.id)
-    loading = send_and_track(cid, f"⏳ Analyzing {key}…", back_button())
-    def analyze():
-        df = get_history(key, "3mo", "1d")
-        ta = compute_ta(df)
-        articles = fetch_news(key)
-        s_sc, s_lbl = sentiment_score(articles)
-        signal, reasons, score = generate_signal(ta, s_sc)
-        price_data = get_price(key)
-        c = COMMODITIES[key]
-        price_str = f"{fmt_price(price_data['price'])} {c['unit']}" if price_data else "N/A"
-        chg_str = (f"  ({'+' if price_data['change']>=0 else ''}{price_data['change']:.2f}%)"
-                   if price_data else "")
-        text = f"🎯 <b>{c['emoji']} {c['name']} — Trading Signal</b>\n\n"
-        text += f"💵 Price: <b>{price_str}</b>{chg_str}\n"
-        text += f"📊 Signal: <b>{signal}</b>  (score: {score:+d})\n\n"
-        if ta:
-            rsi_lbl = "Oversold" if ta['rsi'] < 30 else ("Overbought" if ta['rsi'] > 70 else "Neutral")
-            macd_d = "Bullish ▲" if ta['macd_hist'] > 0 else "Bearish ▼"
-            trend = ("Uptrend ▲" if (ta['ema50'] and ta['ema20'] > ta['ema50'])
-                     else ("Downtrend ▼" if ta['ema50'] else "N/A"))
-            text += (
-                f"<b>── Technical Analysis ──</b>\n"
-                f"RSI(14):  <b>{ta['rsi']:.1f}</b>  ({rsi_lbl})\n"
-                f"MACD:     <b>{macd_d}</b>\n"
-                f"EMA20:    <b>{fmt_price(ta['ema20'])}</b>\n"
-            )
-            if ta['ema50']:
-                text += f"EMA50:    <b>{fmt_price(ta['ema50'])}</b>  ({trend})\n"
-            text += (
-                f"BB Upper: <b>{fmt_price(ta['bb_up'])}</b>\n"
-                f"BB Lower: <b>{fmt_price(ta['bb_lo'])}</b>\n"
-                f"Support:  <b>{fmt_price(ta['support'])}</b>\n"
-                f"Resist:   <b>{fmt_price(ta['resistance'])}</b>\n\n"
-            )
-        text += f"<b>── Sentiment ──</b>\n{s_lbl}  ({s_sc:+.2f})\n\n"
-        text += "<b>── Signal Breakdown ──</b>\n"
-        text += "\n".join(reasons[:7])
-        text += "\n\n⚠️ <i>Not financial advice. DYOR.</i>"
-        if loading:
-            try: bot.delete_message(cid, loading.message_id)
-            except: pass
-        kb = InlineKeyboardMarkup()
-        kb.row(
-            InlineKeyboardButton("📊 See Chart", callback_data=f"cpick_{key}"),
-            InlineKeyboardButton("📰 See News", callback_data=f"nws_{key}"),
-        )
-        kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        send_and_track(cid, text, kb)
-    threading.Thread(target=analyze, daemon=True).start()
+    try:
+        bot.answer_callback_query(call.id, "Analyzing...")
+        key = call.data[len("sig_"):]
+        if key not in COMMODITIES:
+            bot.answer_callback_query(call.id, "Unknown commodity")
+            return
+        cid = call.message.chat.id
+        loading = send_and_track(cid, f"⏳ Analyzing {key}…", back_button())
+        
+        def analyze():
+            try:
+                df = get_history(key, "3mo", "1d")
+                ta = compute_ta(df)
+                articles = fetch_news(key)
+                s_sc, s_lbl = sentiment_score(articles)
+                signal, reasons, score = generate_signal(ta, s_sc)
+                price_data = get_price(key)
+                c = COMMODITIES[key]
+                price_str = f"{fmt_price(price_data['price'])} {c['unit']}" if price_data else "N/A"
+                chg_str = (f"  ({'+' if price_data['change']>=0 else ''}{price_data['change']:.2f}%)"
+                           if price_data else "")
+                text = f"🎯 <b>{c['emoji']} {c['name']} — Trading Signal</b>\n\n"
+                text += f"💵 Price: <b>{price_str}</b>{chg_str}\n"
+                text += f"📊 Signal: <b>{signal}</b>  (score: {score:+d})\n\n"
+                if ta:
+                    rsi_lbl = "Oversold" if ta['rsi'] < 30 else ("Overbought" if ta['rsi'] > 70 else "Neutral")
+                    macd_d = "Bullish ▲" if ta['macd_hist'] > 0 else "Bearish ▼"
+                    trend = ("Uptrend ▲" if (ta['ema50'] and ta['ema20'] > ta['ema50'])
+                             else ("Downtrend ▼" if ta['ema50'] else "N/A"))
+                    text += (
+                        f"<b>── Technical Analysis ──</b>\n"
+                        f"RSI(14):  <b>{ta['rsi']:.1f}</b>  ({rsi_lbl})\n"
+                        f"MACD:     <b>{macd_d}</b>\n"
+                        f"EMA20:    <b>{fmt_price(ta['ema20'])}</b>\n"
+                    )
+                    if ta['ema50']:
+                        text += f"EMA50:    <b>{fmt_price(ta['ema50'])}</b>  ({trend})\n"
+                    text += (
+                        f"BB Upper: <b>{fmt_price(ta['bb_up'])}</b>\n"
+                        f"BB Lower: <b>{fmt_price(ta['bb_lo'])}</b>\n"
+                        f"Support:  <b>{fmt_price(ta['support'])}</b>\n"
+                        f"Resist:   <b>{fmt_price(ta['resistance'])}</b>\n\n"
+                    )
+                text += f"<b>── Sentiment ──</b>\n{s_lbl}  ({s_sc:+.2f})\n\n"
+                text += "<b>── Signal Breakdown ──</b>\n"
+                text += "\n".join(reasons[:7])
+                text += "\n\n⚠️ <i>Not financial advice. DYOR.</i>"
+                if loading:
+                    try: bot.delete_message(cid, loading.message_id)
+                    except: pass
+                kb = InlineKeyboardMarkup()
+                kb.row(
+                    InlineKeyboardButton("📊 See Chart", callback_data=f"cpick_{key}"),
+                    InlineKeyboardButton("📰 See News", callback_data=f"nws_{key}"),
+                )
+                kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+                send_and_track(cid, text, kb)
+            except Exception as e:
+                log.error(f"Error in analyze thread: {e}")
+                if loading:
+                    try: bot.delete_message(cid, loading.message_id)
+                    except: pass
+                safe_send(cid, "❌ Error generating signal. Try again later.", back_button())
+        
+        threading.Thread(target=analyze, daemon=True).start()
+    except Exception as e:
+        log.error(f"Error in cb_sig: {e}")
+        bot.answer_callback_query(call.id, "Error", show_alert=False)
 
 @bot.callback_query_handler(func=lambda c: c.data == "alm")
 def cb_alm(call):
@@ -1034,17 +1110,28 @@ def cb_ald(call):
 @bot.callback_query_handler(func=lambda c: c.data == "prof")
 def cb_prof(call):
     uid = call.from_user.id; cid = call.message.chat.id
+    row = get_profile(uid)
+    if not row:
+        send_and_track(cid, "❌ Profile not found.", back_button())
+        return
+    # row: (user_id, join_date, username, first_name, is_admin)
+    joined = time.strftime("%Y-%m-%d", time.localtime(row[1])) if row[1] else "Unknown"
+    name = row[3] or "—"
+    username = row[2] or "—"
+    admin_badge = "👑 Admin" if (uid in ADMIN_IDS or row[4] == 1) else "👤 User"
     active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND user_id=?", (uid,), fetch_one=True)[0]
     triggered = db_query("SELECT COUNT(*) FROM alerts WHERE active=0 AND user_id=?", (uid,), fetch_one=True)[0]
-    row = get_profile(uid)
-    joined = time.strftime("%Y-%m-%d", time.localtime(row[1])) if row else "Unknown"
-    send_and_track(cid,
+    text = (
         f"👤 <b>Your Profile</b>\n\n"
-        f"ID:               {uid}\n"
-        f"Joined:           {joined}\n"
-        f"Active alerts:    {active}\n"
-        f"Alerts triggered: {triggered}",
-        back_button())
+        f"👑 Role: {admin_badge}\n"
+        f"📛 Name: {h(name)}\n"
+        f"🔖 Username: @{h(username)}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"📅 Joined: {joined}\n"
+        f"🔔 Active alerts: {active}\n"
+        f"✅ Triggered alerts: {triggered}"
+    )
+    send_and_track(cid, text, back_button())
     bot.answer_callback_query(call.id)
 
 # ========== TEXT HANDLER ==========
@@ -1084,7 +1171,7 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Commodity Oracle Bot started — NewsAPI integrated for fresh news")
+log.info("🚀 Commodity Oracle Bot started — metals spot tickers, 1D chart (30m), current price on chart, enhanced profile & stats")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
