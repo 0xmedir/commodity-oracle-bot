@@ -57,7 +57,7 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
-# ========== COMMODITIES – ALL YFINANCE FUTURES (RELIABLE) ==========
+# ========== COMMODITIES – ALL YFINANCE FUTURES ==========
 COMMODITIES = {
     "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
     "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
@@ -129,7 +129,7 @@ db_query("""CREATE TABLE IF NOT EXISTS profiles (
 )""")
 try:
     db_query("ALTER TABLE profiles ADD COLUMN is_admin INTEGER DEFAULT 0")
-except sqlite3.OperationalError:
+except:
     pass
 
 db_query("""CREATE TABLE IF NOT EXISTS alerts (
@@ -179,10 +179,8 @@ def is_admin(uid):
     return row and row[0] == 1
 
 def delete_msg(m):
-    try:
-        bot.delete_message(m.chat.id, m.message_id)
-    except:
-        pass
+    try: bot.delete_message(m.chat.id, m.message_id)
+    except: pass
 
 def safe_send(cid, text, markup=None):
     try:
@@ -206,8 +204,7 @@ def safe_edit(cid, mid, text, markup=None):
         bot.edit_message_text(text, cid, mid, parse_mode="HTML", reply_markup=markup)
         return True
     except ApiTelegramException as e:
-        if "message is not modified" in str(e):
-            return True
+        if "message is not modified" in str(e): return True
         log.warning(f"edit error: {e}")
         return False
     except Exception as e:
@@ -219,16 +216,13 @@ q_lock = threading.RLock()
 
 def send_and_track(cid, text, markup=None):
     sent = safe_send(cid, text, markup)
-    if not sent:
-        return None
+    if not sent: return None
     with q_lock:
         msg_queue.setdefault(cid, []).append(sent.message_id)
         while len(msg_queue[cid]) > MAX_HISTORY:
             old = msg_queue[cid].pop(0)
-            try:
-                bot.delete_message(cid, old)
-            except:
-                pass
+            try: bot.delete_message(cid, old)
+            except: pass
     return sent
 
 def back_button():
@@ -236,7 +230,7 @@ def back_button():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-# ========== PRICE FETCHING WITH TIMEOUT AND FIXED YFINANCE ==========
+# ========== PRICE FETCHING (SAFE, WITH TIMEOUTS) ==========
 def _flatten(df):
     if df is None: return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -244,10 +238,9 @@ def _flatten(df):
     return df
 
 def _download_yf(symbol, period, interval):
-    """Download with thread timeout and disable threading to avoid SQLite locks."""
     def download():
         try:
-            # Use yf.download with threads=False to prevent database lock
+            # Use yf.download with threads=False and auto_adjust to avoid SQLite locks
             df = yf.download(symbol, period=period, interval=interval,
                              progress=False, auto_adjust=True, threads=False)
             if df is not None and not df.empty:
@@ -256,7 +249,6 @@ def _download_yf(symbol, period, interval):
                     return df
         except Exception as e:
             log.warning(f"yf.download failed {symbol}: {e}")
-        # Fallback to Ticker.history
         try:
             df = yf.Ticker(symbol).history(period=period, interval=interval)
             if df is not None and not df.empty:
@@ -266,7 +258,6 @@ def _download_yf(symbol, period, interval):
         except Exception as e:
             log.warning(f"ticker.history failed {symbol}: {e}")
         return None
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(download)
         try:
@@ -308,7 +299,7 @@ def get_history(key, period="1mo", interval="1d"):
         cache.set(ck, df, ttl=HIST_TTL)
     return df
 
-# ========== NEWS FETCHING (unchanged) ==========
+# ========== NEWS & SENTIMENT ==========
 def fetch_news(key, max_items=6):
     ck = f"news_{key}"
     cached = cache.get(ck)
@@ -399,7 +390,7 @@ def headline_emoji(title):
     elif s < -0.2: return "🔴"
     return "⚪"
 
-# ========== TECHNICAL ANALYSIS (unchanged) ==========
+# ========== TECHNICAL ANALYSIS ==========
 def compute_ta(df):
     if df is None or len(df) < 20: return None
     close = df["Close"].squeeze().dropna()
@@ -528,9 +519,9 @@ def generate_chart(key, period="1mo", interval="1d"):
 
     c = COMMODITIES[key]
     cl = df["Close"].values.astype(float)
-    op = df["Open"].values.astype(float)  if "Open"   in df.columns else cl.copy()
-    hi = df["High"].values.astype(float)  if "High"   in df.columns else cl.copy()
-    lo = df["Low"].values.astype(float)   if "Low"    in df.columns else cl.copy()
+    op = df["Open"].values.astype(float) if "Open" in df.columns else cl.copy()
+    hi = df["High"].values.astype(float) if "High" in df.columns else cl.copy()
+    lo = df["Low"].values.astype(float) if "Low" in df.columns else cl.copy()
     vol = df["Volume"].values.astype(float) if "Volume" in df.columns else np.zeros(len(df))
 
     n = len(df)
@@ -618,9 +609,606 @@ def generate_chart(key, period="1mo", interval="1d"):
     buf.seek(0)
     return buf
 
-# ========== ALERTS, PROFILES, UI BUILDERS (unchanged from previous working version) ==========
-# ... (keeping the rest identical to your last working script to avoid repetition)
-# For brevity, I am including the remaining functions as they were in the previous script.
+# ========== ALERTS ==========
+def add_alert(uid, cid, commodity, target, direction):
+    cnt = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND user_id=?", (uid,), fetch_one=True)[0]
+    if cnt >= MAX_ALERTS:
+        return None, f"❌ Max {MAX_ALERTS} alerts reached."
+    aid = db_query(
+        "INSERT INTO alerts(user_id,chat_id,commodity,target,direction,created_at) VALUES(?,?,?,?,?,?)",
+        (uid, cid, commodity, target, direction, int(time.time()))
+    )
+    return aid, None
 
-# NOTE: The full script is long. I am providing the complete final script as a single block below.
-# Since the assistant message has a character limit, I will continue in the next response with the full file.
+def get_alerts(cid=None):
+    if cid:
+        rows = db_query(
+            "SELECT id,user_id,chat_id,commodity,target,direction FROM alerts WHERE active=1 AND chat_id=?",
+            (cid,), fetch_all=True)
+    else:
+        rows = db_query(
+            "SELECT id,user_id,chat_id,commodity,target,direction FROM alerts WHERE active=1",
+            fetch_all=True)
+    return [{"id":r[0],"uid":r[1],"cid":r[2],"commodity":r[3],"target":r[4],"direction":r[5]}
+            for r in (rows or [])]
+
+def deactivate_alert(aid):
+    db_query("UPDATE alerts SET active=0 WHERE id=?", (aid,))
+
+def alert_loop():
+    while True:
+        try:
+            for a in get_alerts():
+                data = get_price(a["commodity"])
+                if not data: continue
+                price = data["price"]
+                hit = (a["direction"] == ">" and price >= a["target"]) or \
+                      (a["direction"] == "<" and price <= a["target"])
+                if not hit: continue
+                c = COMMODITIES.get(a["commodity"], {})
+                sent = safe_send(
+                    a["cid"],
+                    f"🚨 <b>COMMODITY ALERT TRIGGERED</b>\n\n"
+                    f"{c.get('emoji','📦')} <b>{c.get('name', a['commodity'])}</b> "
+                    f"{h(a['direction'])} <b>${a['target']:,.2f}</b>\n"
+                    f"💵 Current: <b>{fmt_price(price)}</b> {c.get('unit','')}"
+                )
+                if sent:
+                    deactivate_alert(a["id"])
+        except Exception as e:
+            log.error(f"Alert loop: {e}")
+        time.sleep(30)
+
+threading.Thread(target=alert_loop, daemon=True).start()
+
+# ========== PROFILES ==========
+def ensure_profile(uid, uname, fname):
+    db_query(
+        "INSERT OR IGNORE INTO profiles(user_id,join_date,username,first_name) VALUES(?,?,?,?)",
+        (uid, int(time.time()), uname or "", fname or "")
+    )
+
+def get_profile(uid):
+    return db_query("SELECT * FROM profiles WHERE user_id=?", (uid,), fetch_one=True)
+
+def get_all_profiles():
+    return db_query("SELECT user_id, first_name, username, join_date FROM profiles ORDER BY join_date", fetch_all=True)
+
+# ========== UI BUILDERS ==========
+def main_menu():
+    text = (
+        "⚗️ <b>COMMODITY ORACLE</b>\n\n"
+        "Real-time intelligence for global commodity markets.\n"
+        "Energy · Metals · Agriculture"
+    )
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("💰 Live Prices", callback_data="px"),
+        InlineKeyboardButton("📊 Charts", callback_data="cht_menu"),
+    )
+    kb.row(
+        InlineKeyboardButton("📰 News & Sentiment", callback_data="nws_menu"),
+        InlineKeyboardButton("🎯 Trading Signal", callback_data="sig_menu"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔔 Set Alert", callback_data="alm"),
+        InlineKeyboardButton("📋 My Alerts", callback_data="all"),
+    )
+    kb.row(InlineKeyboardButton("👤 Profile", callback_data="prof"))
+    return text, kb
+
+def commodity_picker(cb_prefix, title, subtitle=""):
+    text = f"{title}\n<i>{subtitle}</i>" if subtitle else title
+    kb = InlineKeyboardMarkup()
+    for _, (glabel, keys) in GROUPS.items():
+        row = [InlineKeyboardButton(
+            f"{COMMODITIES[k]['emoji']} {k}", callback_data=f"{cb_prefix}{k}"
+        ) for k in keys]
+        kb.row(*row)
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def timeframe_picker(key):
+    c = COMMODITIES[key]
+    text = f"📊 <b>{c['emoji']} {c['name']}</b>\n\nSelect timeframe:"
+    kb = InlineKeyboardMarkup()
+    row = []
+    for tf in TIMEFRAMES:
+        row.append(InlineKeyboardButton(tf, callback_data=f"ctf_{key}_{tf}"))
+        if len(row) == 3:
+            kb.row(*row); row = []
+    if row: kb.row(*row)
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def alerts_menu():
+    text = "🔔 <b>Price Alerts</b>\n\nQuick presets or set a custom alert:"
+    kb = InlineKeyboardMarkup()
+    presets = [
+        ("WTI > $90", "alp_WTI_>_90"),
+        ("WTI < $70", "alp_WTI_<_70"),
+        ("GOLD > $3300", "alp_GOLD_>_3300"),
+        ("GOLD < $3000", "alp_GOLD_<_3000"),
+        ("NATGAS > $4", "alp_NATGAS_>_4"),
+        ("SILVER > $35", "alp_SILVER_>_35"),
+    ]
+    for i in range(0, len(presets), 2):
+        kb.row(*[InlineKeyboardButton(lbl, callback_data=cd) for lbl, cd in presets[i:i+2]])
+    kb.row(InlineKeyboardButton("✏️ Custom Alert", callback_data="alc"))
+    kb.row(InlineKeyboardButton("📋 My Alerts", callback_data="all"))
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return text, kb
+
+def build_prices_text():
+    lines = ["💰 <b>Live Commodity Prices</b>\n"]
+    for _, (glabel, keys) in GROUPS.items():
+        lines.append(f"<b>{glabel}</b>")
+        for key in keys:
+            c = COMMODITIES[key]
+            data = get_price(key)
+            if data:
+                arrow = "▲" if data["change"] >= 0 else "▼"
+                bullet = "🟢" if data["change"] >= 0 else "🔴"
+                lines.append(
+                    f"{bullet} {c['emoji']} <b>{c['name']}</b>\n"
+                    f"   {fmt_price(data['price'])} {c['unit']}  {bullet}{arrow} {abs(data['change']):.2f}%"
+                )
+            else:
+                lines.append(f"⚪ {c['emoji']} <b>{c['name']}</b>  —  N/A")
+        lines.append("")
+    lines.append(f"<i>🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}</i>")
+    return "\n".join(lines)
+
+# ========== COMMAND HANDLERS ==========
+waiting = {}
+wait_lock = threading.RLock()
+
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(m):
+    delete_msg(m)
+    ensure_profile(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    text, kb = main_menu()
+    send_and_track(m.chat.id, text, kb)
+
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(m):
+    delete_msg(m)
+    with wait_lock:
+        waiting.pop((m.chat.id, m.from_user.id), None)
+    send_and_track(m.chat.id, "❌ Cancelled.", back_button())
+
+@bot.message_handler(commands=["prices"])
+def cmd_prices(m):
+    delete_msg(m)
+    _send_prices(m.chat.id)
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(m):
+    if not is_admin(m.from_user.id):
+        safe_send(m.chat.id, "⛔ Admin only command.")
+        return
+    delete_msg(m)
+    users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
+    active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
+    triggered = db_query("SELECT COUNT(*) FROM alerts WHERE active=0", fetch_one=True)[0]
+    row = db_query("SELECT commodity, COUNT(*) as cnt FROM alerts WHERE active=1 GROUP BY commodity ORDER BY cnt DESC LIMIT 1", fetch_one=True)
+    most_active = f"{row[0]} ({row[1]} alerts)" if row else "None"
+    safe_send(m.chat.id,
+        f"📊 <b>Bot Stats</b>\n\n"
+        f"👥 Total users: {users}\n"
+        f"🔔 Active alerts: {active}\n"
+        f"✅ Triggered alerts: {triggered}\n"
+        f"🔥 Most active commodity: {most_active}")
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(m):
+    if not is_admin(m.from_user.id):
+        safe_send(m.chat.id, "⛔ Admin only command.")
+        return
+    delete_msg(m)
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        safe_send(m.chat.id, "Usage: /broadcast <message>"); return
+    msg = parts[1]
+    rows = db_query("SELECT DISTINCT user_id FROM profiles", fetch_all=True) or []
+    sent = failed = 0
+    for (uid,) in rows:
+        r = safe_send(uid, msg)
+        if r: sent += 1
+        else: failed += 1
+        time.sleep(0.05)
+    safe_send(m.chat.id, f"✅ Sent: {sent}  ❌ Failed: {failed}")
+
+@bot.message_handler(commands=["users"])
+def cmd_users(m):
+    if not is_admin(m.from_user.id):
+        safe_send(m.chat.id, "⛔ Admin only command.")
+        return
+    delete_msg(m)
+    rows = get_all_profiles()
+    if not rows:
+        safe_send(m.chat.id, "📭 No users found.")
+        return
+    lines = ["📋 <b>Bot Users</b>\n"]
+    for uid, first_name, username, join_date in rows:
+        name = first_name or "—"
+        uname = f"@{username}" if username else "—"
+        joined = time.strftime("%Y-%m-%d", time.localtime(join_date)) if join_date else "unknown"
+        lines.append(f"👤 <b>{h(name)}</b>  ({uname}) — joined {joined}")
+    final_text = "\n".join(lines)
+    safe_send(m.chat.id, final_text, back_button())
+
+# ========== CALLBACK HANDLERS ==========
+@bot.callback_query_handler(func=lambda c: c.data == "back_main")
+def cb_back(call):
+    with wait_lock:
+        waiting.pop((call.message.chat.id, call.from_user.id), None)
+    text, kb = main_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == "px")
+def cb_px(call):
+    bot.answer_callback_query(call.id)
+    _send_prices(call.message.chat.id)
+
+def _send_prices(cid):
+    loading = send_and_track(cid, "⏳ Fetching live prices…", back_button())
+
+    def fetch():
+        # Sequential fetch with individual timeouts; global timeout handled below
+        for key in COMMODITIES:
+            get_price(key)  # each has 10s timeout internally
+        text = build_prices_text()
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("🔄 Refresh", callback_data="px"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+        )
+        if loading:
+            try: bot.delete_message(cid, loading.message_id)
+            except: pass
+        send_and_track(cid, text, kb)
+
+    # Run with a global 25-second timeout
+    fetch_thread = threading.Thread(target=fetch)
+    fetch_thread.daemon = True
+    fetch_thread.start()
+    fetch_thread.join(timeout=25)
+    if fetch_thread.is_alive():
+        log.error("Price fetch timed out overall")
+        text = build_prices_text()  # use whatever is cached
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("🔄 Refresh", callback_data="px"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+        )
+        if loading:
+            try: bot.delete_message(cid, loading.message_id)
+            except: pass
+        send_and_track(cid, text, kb)
+
+@bot.callback_query_handler(func=lambda c: c.data == "cht_menu")
+def cb_cht_menu(call):
+    text, kb = commodity_picker("cpick_", "📊 <b>Charts</b>", "Pick a commodity.")
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cpick_"))
+def cb_cpick(call):
+    key = call.data[len("cpick_"):]
+    if key not in COMMODITIES:
+        bot.answer_callback_query(call.id, "Unknown"); return
+    text, kb = timeframe_picker(key)
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ctf_"))
+def cb_ctf(call):
+    parts = call.data.split("_", 2)
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "Bad format"); return
+    key, tf = parts[1], parts[2]
+    if key not in COMMODITIES or tf not in TIMEFRAMES:
+        bot.answer_callback_query(call.id, "Invalid"); return
+    cid = call.message.chat.id
+    period, interval = TIMEFRAMES[tf]
+    bot.answer_callback_query(call.id, "Generating chart…")
+    loading = send_and_track(cid, f"⏳ Building {key} {tf} chart…", back_button())
+    def gen():
+        buf = generate_chart(key, period, interval)
+        if loading:
+            try: bot.delete_message(cid, loading.message_id)
+            except: pass
+        if buf:
+            c = COMMODITIES[key]
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🎯 Get Signal", callback_data=f"sig_{key}"),
+                InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+            )
+            try:
+                bot.send_photo(cid, buf,
+                    caption=f"{c['emoji']} <b>{c['name']}</b> — {tf}",
+                    reply_markup=kb, parse_mode="HTML")
+            except Exception as e:
+                log.error(f"Chart send: {e}")
+                safe_send(cid, "❌ Chart send failed.", back_button())
+        else:
+            safe_send(cid,
+                "❌ No chart data available.\n"
+                "<i>Try a longer timeframe (1M, 3M) or check back later.</i>",
+                back_button())
+    threading.Thread(target=gen, daemon=True).start()
+
+@bot.callback_query_handler(func=lambda c: c.data == "nws_menu")
+def cb_nws_menu(call):
+    text, kb = commodity_picker("nws_", "📰 <b>News & Sentiment</b>",
+                                "Headlines + VADER sentiment score.")
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("nws_") and c.data != "nws_menu")
+def cb_nws(call):
+    key = call.data[len("nws_"):]
+    if key not in COMMODITIES:
+        bot.answer_callback_query(call.id, "Unknown"); return
+    cid = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    loading = send_and_track(cid, f"⏳ Fetching {key} news…", back_button())
+    def fetch():
+        try:
+            articles = fetch_news(key)
+            avg, label = sentiment_score(articles)
+            c = COMMODITIES[key]
+            text = f"📰 <b>{c['emoji']} {c['name']} — News & Sentiment</b>\n\n"
+            text += f"📊 Overall: <b>{label}</b>  ({avg:+.2f})\n"
+            if VADER_OK:
+                bar = "█" * int(abs(avg) * 10) or "░"
+                text += f"{'▶' if avg >= 0 else '◀'} {bar}\n"
+            text += "\n"
+            if articles:
+                for i, a in enumerate(articles[:6], 1):
+                    em = headline_emoji(a["title"])
+                    title = h(a["title"][:110])
+                    text += f"{em} <b>{i}.</b> {title}\n"
+                    if a["link"]:
+                        text += f"   <a href='{h(a['link'])}'>Read →</a>\n"
+                    text += "\n"
+            else:
+                text += "<i>No recent headlines found. Try again later.</i>\n"
+            text += "<i>Source: NewsAPI, Reuters, Yahoo Finance, MarketWatch</i>"
+            if loading:
+                try: bot.delete_message(cid, loading.message_id)
+                except: pass
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("🎯 Get Signal", callback_data=f"sig_{key}"),
+                InlineKeyboardButton("⬅️ Back", callback_data="back_main"),
+            )
+            send_and_track(cid, text, kb)
+        except Exception as e:
+            log.error(f"News fetch error: {e}")
+            if loading:
+                try: bot.delete_message(cid, loading.message_id)
+                except: pass
+            safe_send(cid, "❌ Error fetching news. Try again later.", back_button())
+    threading.Thread(target=fetch, daemon=True).start()
+
+@bot.callback_query_handler(func=lambda c: c.data == "sig_menu")
+def cb_sig_menu(call):
+    try:
+        bot.answer_callback_query(call.id)
+        text, kb = commodity_picker("sig_", "🎯 <b>Trading Signal</b>",
+                                    "RSI · MACD · Bollinger · EMA · Sentiment combined.")
+        send_and_track(call.message.chat.id, text, kb)
+    except Exception as e:
+        log.error(f"Error in cb_sig_menu: {e}")
+        bot.answer_callback_query(call.id, "Error", show_alert=False)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sig_") and c.data != "sig_menu")
+def cb_sig(call):
+    try:
+        bot.answer_callback_query(call.id, "Analyzing...")
+        key = call.data[len("sig_"):]
+        if key not in COMMODITIES:
+            bot.answer_callback_query(call.id, "Unknown commodity")
+            return
+        cid = call.message.chat.id
+        loading = send_and_track(cid, f"⏳ Analyzing {key}…", back_button())
+        def analyze():
+            try:
+                df = get_history(key, "3mo", "1d")
+                ta = compute_ta(df)
+                articles = fetch_news(key)
+                s_sc, s_lbl = sentiment_score(articles)
+                signal, reasons, score = generate_signal(ta, s_sc)
+                price_data = get_price(key)
+                c = COMMODITIES[key]
+                price_str = f"{fmt_price(price_data['price'])} {c['unit']}" if price_data else "N/A"
+                chg_str = (f"  ({'+' if price_data['change']>=0 else ''}{price_data['change']:.2f}%)"
+                           if price_data else "")
+                text = f"🎯 <b>{c['emoji']} {c['name']} — Trading Signal</b>\n\n"
+                text += f"💵 Price: <b>{price_str}</b>{chg_str}\n"
+                text += f"📊 Signal: <b>{signal}</b>  (score: {score:+d})\n\n"
+                if ta:
+                    rsi_lbl = "Oversold" if ta['rsi'] < 30 else ("Overbought" if ta['rsi'] > 70 else "Neutral")
+                    macd_d = "Bullish ▲" if ta['macd_hist'] > 0 else "Bearish ▼"
+                    trend = ("Uptrend ▲" if (ta['ema50'] and ta['ema20'] > ta['ema50'])
+                             else ("Downtrend ▼" if ta['ema50'] else "N/A"))
+                    text += (
+                        f"<b>── Technical Analysis ──</b>\n"
+                        f"RSI(14):  <b>{ta['rsi']:.1f}</b>  ({rsi_lbl})\n"
+                        f"MACD:     <b>{macd_d}</b>\n"
+                        f"EMA20:    <b>{fmt_price(ta['ema20'])}</b>\n"
+                    )
+                    if ta['ema50']:
+                        text += f"EMA50:    <b>{fmt_price(ta['ema50'])}</b>  ({trend})\n"
+                    text += (
+                        f"BB Upper: <b>{fmt_price(ta['bb_up'])}</b>\n"
+                        f"BB Lower: <b>{fmt_price(ta['bb_lo'])}</b>\n"
+                        f"Support:  <b>{fmt_price(ta['support'])}</b>\n"
+                        f"Resist:   <b>{fmt_price(ta['resistance'])}</b>\n\n"
+                    )
+                text += f"<b>── Sentiment ──</b>\n{s_lbl}  ({s_sc:+.2f})\n\n"
+                text += "<b>── Signal Breakdown ──</b>\n"
+                text += "\n".join(reasons[:7])
+                text += "\n\n⚠️ <i>Not financial advice. DYOR.</i>"
+                if loading:
+                    try: bot.delete_message(cid, loading.message_id)
+                    except: pass
+                kb = InlineKeyboardMarkup()
+                kb.row(
+                    InlineKeyboardButton("📊 See Chart", callback_data=f"cpick_{key}"),
+                    InlineKeyboardButton("📰 See News", callback_data=f"nws_{key}"),
+                )
+                kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+                send_and_track(cid, text, kb)
+            except Exception as e:
+                log.error(f"Error in analyze thread: {e}")
+                if loading:
+                    try: bot.delete_message(cid, loading.message_id)
+                    except: pass
+                safe_send(cid, "❌ Error generating signal. Try again later.", back_button())
+        threading.Thread(target=analyze, daemon=True).start()
+    except Exception as e:
+        log.error(f"Error in cb_sig: {e}")
+        bot.answer_callback_query(call.id, "Error", show_alert=False)
+
+@bot.callback_query_handler(func=lambda c: c.data == "alm")
+def cb_alm(call):
+    text, kb = alerts_menu()
+    send_and_track(call.message.chat.id, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("alp_"))
+def cb_alp(call):
+    parts = call.data.split("_")
+    if len(parts) < 4:
+        bot.answer_callback_query(call.id, "Invalid"); return
+    key, direction, target_str = parts[1], parts[2], parts[3]
+    try: target = float(target_str)
+    except: bot.answer_callback_query(call.id, "Bad value"); return
+    uid = call.from_user.id; cid = call.message.chat.id
+    aid, err = add_alert(uid, cid, key, target, direction)
+    c = COMMODITIES.get(key, {})
+    if err:
+        send_and_track(cid, err, back_button())
+    else:
+        send_and_track(cid,
+            f"✅ Alert set!\n"
+            f"{c.get('emoji','📦')} <b>{c.get('name', key)}</b> {direction} <b>${target:,.2f}</b>",
+            back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == "alc")
+def cb_alc(call):
+    cid = call.message.chat.id; uid = call.from_user.id
+    with wait_lock:
+        waiting[(cid, uid)] = "custom_alert"
+    send_and_track(cid,
+        f"✏️ <b>Custom Alert</b>\n\n"
+        f"Format: <code>KEY DIRECTION VALUE</code>\n"
+        f"Example: <code>GOLD > 3200</code>\n\n"
+        f"Keys: <code>{', '.join(COMMODITIES)}</code>\n\n"
+        f"Send /cancel to abort.",
+        back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == "all")
+def cb_all(call):
+    cid = call.message.chat.id; uid = call.from_user.id
+    my = [a for a in get_alerts(cid) if a["uid"] == uid]
+    if not my:
+        send_and_track(cid, "🔕 No active alerts.", back_button())
+    else:
+        text = "🔔 <b>Your Active Alerts</b>\n\n"
+        kb = InlineKeyboardMarkup()
+        for a in my:
+            c = COMMODITIES.get(a["commodity"], {})
+            name = c.get("name", a["commodity"])
+            text += f"• {name} {a['direction']} ${a['target']:,.2f}\n"
+            kb.row(InlineKeyboardButton(
+                f"❌ {a['commodity']} {a['direction']} ${a['target']:,.2f}",
+                callback_data=f"ald_{a['id']}"
+            ))
+        kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+        send_and_track(cid, text, kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ald_"))
+def cb_ald(call):
+    try:
+        deactivate_alert(int(call.data.split("_")[-1]))
+        send_and_track(call.message.chat.id, "✅ Alert cancelled.", back_button())
+    except:
+        send_and_track(call.message.chat.id, "❌ Failed.", back_button())
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda c: c.data == "prof")
+def cb_prof(call):
+    uid = call.from_user.id; cid = call.message.chat.id
+    row = get_profile(uid)
+    if not row:
+        send_and_track(cid, "❌ Profile not found.", back_button())
+        return
+    joined = time.strftime("%Y-%m-%d", time.localtime(row[1])) if row[1] else "Unknown"
+    name = row[3] or "—"
+    username = row[2] or "—"
+    admin_badge = "👑 Admin" if (uid in ADMIN_IDS or row[4] == 1) else "👤 User"
+    active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1 AND user_id=?", (uid,), fetch_one=True)[0]
+    triggered = db_query("SELECT COUNT(*) FROM alerts WHERE active=0 AND user_id=?", (uid,), fetch_one=True)[0]
+    text = (
+        f"👤 <b>Your Profile</b>\n\n"
+        f"👑 Role: {admin_badge}\n"
+        f"📛 Name: {h(name)}\n"
+        f"🔖 Username: @{h(username)}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"📅 Joined: {joined}\n"
+        f"🔔 Active alerts: {active}\n"
+        f"✅ Triggered alerts: {triggered}"
+    )
+    send_and_track(cid, text, back_button())
+    bot.answer_callback_query(call.id)
+
+# ========== TEXT HANDLER ==========
+@bot.message_handler(func=lambda m: True)
+def text_handler(m):
+    if m.text and m.text.startswith("/"): return
+    cid = m.chat.id; uid = m.from_user.id
+    with wait_lock:
+        state = waiting.pop((cid, uid), None)
+    if not state: return
+    delete_msg(m)
+
+    if state == "custom_alert":
+        match = re.match(r"^(\w+)\s*([<>])\s*([\d.]+)$", (m.text or "").strip().upper())
+        if not match:
+            send_and_track(cid, "❌ Bad format. Example: <code>GOLD > 3200</code>", back_button()); return
+        key, direction, val_str = match.groups()
+        if key not in COMMODITIES:
+            send_and_track(cid, f"❌ Unknown: <b>{key}</b>\nOptions: {', '.join(COMMODITIES)}", back_button()); return
+        target = float(val_str)
+        aid, err = add_alert(uid, cid, key, target, direction)
+        c = COMMODITIES[key]
+        if err:
+            send_and_track(cid, err, back_button())
+        else:
+            send_and_track(cid,
+                f"✅ Alert set!\n{c['emoji']} <b>{c['name']}</b> {direction} <b>${target:,.2f}</b>",
+                back_button())
+
+# ========== SHUTDOWN ==========
+def stop(sig, frame):
+    log.info("Shutting down…")
+    try: bot.stop_polling()
+    except: pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+
+log.info("🚀 Commodity Oracle Bot started — price fetch fixed (timeouts + cache fix)")
+bot.delete_webhook()
+time.sleep(1)
+bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
