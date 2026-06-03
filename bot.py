@@ -38,7 +38,13 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set")
     sys.exit(1)
 
-NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "613f0647c1904f35908015d3637fda26")
+# NewsAPI key is optional – if not set, only RSS feeds will be used
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "").strip()
+if NEWS_API_KEY:
+    print("✅ NewsAPI key loaded")
+else:
+    print("⚠️ No NewsAPI key set – using RSS only")
+
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 MAX_ALERTS = 20
 MAX_HISTORY = 5
@@ -53,7 +59,6 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
 # ========== COMMODITIES ==========
-# Metals use spot tickers (more accurate), others use futures
 COMMODITIES = {
     "WTI":      {"symbol": "CL=F",     "name": "WTI Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
     "BRENT":    {"symbol": "BZ=F",     "name": "Brent Crude Oil", "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
@@ -92,7 +97,6 @@ RSS_FEEDS = [
     "https://www.marketwatch.com/rss/marketpulse",
 ]
 
-# 1D added with 30m candles (more reliable than 5m)
 TIMEFRAMES = {
     "1D":  ("1d",  "30m"),
     "5D":  ("5d",  "1h"),
@@ -102,7 +106,7 @@ TIMEFRAMES = {
     "1Y":  ("1y",  "1wk"),
 }
 
-# ========== DATABASE ==========
+# ========== DATABASE with schema upgrade ==========
 db_path = "data/commodity.db"
 db_lock = threading.RLock()
 conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -119,20 +123,29 @@ def db_query(sql, params=(), fetch_one=False, fetch_all=False):
             rows = cur.fetchall(); conn.commit(); return rows
         conn.commit(); return cur.lastrowid
 
-db_query("""CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER, chat_id INTEGER,
-    commodity TEXT, target REAL, direction TEXT,
-    active INTEGER DEFAULT 1, created_at INTEGER
-)""")
+# Create profiles table with is_admin column (if not exists)
 db_query("""CREATE TABLE IF NOT EXISTS profiles (
     user_id INTEGER PRIMARY KEY,
     join_date INTEGER, username TEXT, first_name TEXT,
     is_admin INTEGER DEFAULT 0
 )""")
 
-# Mark admins from env as admin in DB
+# Add is_admin column to existing table if missing (schema upgrade)
+try:
+    db_query("ALTER TABLE profiles ADD COLUMN is_admin INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass  # column already exists
+
+# Create alerts table
+db_query("""CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, chat_id INTEGER,
+    commodity TEXT, target REAL, direction TEXT,
+    active INTEGER DEFAULT 1, created_at INTEGER
+)""")
+
 def init_admins():
+    """Mark users from ADMIN_IDS as admin in the database."""
     for uid in ADMIN_IDS:
         db_query("UPDATE profiles SET is_admin=1 WHERE user_id=?", (uid,))
 init_admins()
@@ -178,7 +191,6 @@ def delete_msg(m):
         pass
 
 def safe_send(cid, text, markup=None):
-    """Send message with HTML fallback to plain text on parse errors."""
     try:
         return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True, parse_mode="HTML")
     except ApiTelegramException as e:
@@ -310,7 +322,7 @@ def fetch_news(key, max_items=6):
     query = query_map.get(key, COMMODITIES[key]["name"])
     articles = []
 
-    if NEWS_API_KEY and NEWS_API_KEY.strip():
+    if NEWS_API_KEY:
         try:
             url = "https://newsapi.org/v2/everything"
             params = {
@@ -482,7 +494,7 @@ def generate_signal(ta, sentiment=0.0):
 
     return sig, reasons, score
 
-# ========== CHART GENERATION with current price annotation ==========
+# ========== CHART GENERATION ==========
 BG     = "#0d1117"
 GRID   = "#21262d"
 TEXT   = "#e6edf3"
@@ -517,7 +529,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     x = np.arange(n)
     up = cl >= op
 
-    # Indicators
     cs      = pd.Series(cl)
     delta   = cs.diff()
     gain    = delta.clip(lower=0).rolling(14).mean()
@@ -531,7 +542,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     bb_lo_v = (bb_mid - 2 * bb_std).values
 
     last_price = cl[-1]
-    last_date = df.index[-1]
 
     fig = plt.figure(figsize=(13, 9), facecolor=BG)
     gs  = fig.add_gridspec(3, 1, height_ratios=[4, 1, 2], hspace=0.06)
@@ -541,7 +551,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     for ax in [ax1, ax2, ax3]:
         _style_ax(ax)
 
-    # Candles
     up_i = np.where(up)[0];  dn_i = np.where(~up)[0]
     ax1.bar(up_i, np.abs(cl[up_i] - op[up_i]),
             bottom=np.minimum(op[up_i], cl[up_i]),
@@ -552,7 +561,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax1.vlines(up_i, lo[up_i], hi[up_i], color=GREEN, linewidth=0.8)
     ax1.vlines(dn_i, lo[dn_i], hi[dn_i], color=RED,   linewidth=0.8)
 
-    # EMA & BB
     ax1.plot(x, ema20,   color=ORANGE, linewidth=1.2, label="EMA20", alpha=0.9)
     ax1.fill_between(x, bb_up_v, bb_lo_v, alpha=0.08, color=BLUE)
     ax1.plot(x, bb_up_v, color=BLUE, linewidth=0.7, linestyle="--", alpha=0.6, label="BB±2σ")
@@ -569,7 +577,6 @@ def generate_chart(key, period="1mo", interval="1d"):
                loc="upper left", framealpha=0.7)
     ax1.tick_params(labelbottom=False)
 
-    # Volume
     vol_c = np.where(up, GREEN, RED)
     ax2.bar(x, vol, color=vol_c, width=0.65, alpha=0.65)
     ax2.set_ylabel("Volume", color=MUTED, fontsize=8)
@@ -577,7 +584,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     if vol.max() > 0:
         ax2.set_ylim(0, vol.max() * 1.3)
 
-    # RSI
     ax3.plot(x, rsi_s, color=PURPLE, linewidth=1.3)
     ax3.axhline(70, color=RED,   linewidth=0.8, linestyle="--", alpha=0.7)
     ax3.axhline(30, color=GREEN, linewidth=0.8, linestyle="--", alpha=0.7)
@@ -786,7 +792,6 @@ def cmd_stats(m):
     users = db_query("SELECT COUNT(*) FROM profiles", fetch_one=True)[0]
     active = db_query("SELECT COUNT(*) FROM alerts WHERE active=1", fetch_one=True)[0]
     triggered = db_query("SELECT COUNT(*) FROM alerts WHERE active=0", fetch_one=True)[0]
-    # Most active commodity
     row = db_query("SELECT commodity, COUNT(*) as cnt FROM alerts WHERE active=1 GROUP BY commodity ORDER BY cnt DESC LIMIT 1", fetch_one=True)
     most_active = f"{row[0]} ({row[1]} alerts)" if row else "None"
     safe_send(m.chat.id,
@@ -816,10 +821,6 @@ def cmd_broadcast(m):
     safe_send(m.chat.id, f"✅ Sent: {sent}  ❌ Failed: {failed}")
 
 # ========== CALLBACK HANDLERS ==========
-@bot.callback_query_handler(func=lambda call: True)
-def debug_callback(call):
-    log.info(f"Callback received: {call.data} from {call.from_user.id}")
-
 @bot.callback_query_handler(func=lambda c: c.data == "back_main")
 def cb_back(call):
     with wait_lock:
@@ -1114,7 +1115,6 @@ def cb_prof(call):
     if not row:
         send_and_track(cid, "❌ Profile not found.", back_button())
         return
-    # row: (user_id, join_date, username, first_name, is_admin)
     joined = time.strftime("%Y-%m-%d", time.localtime(row[1])) if row[1] else "Unknown"
     name = row[3] or "—"
     username = row[2] or "—"
