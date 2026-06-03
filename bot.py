@@ -20,7 +20,7 @@ import html
 import signal
 import re
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 
@@ -38,13 +38,8 @@ if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set")
     sys.exit(1)
 
-# NewsAPI key is optional – if not set, only RSS feeds will be used
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "").strip()
-if NEWS_API_KEY:
-    print("✅ NewsAPI key loaded")
-else:
-    print("⚠️ No NewsAPI key set – using RSS only")
-
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 MAX_ALERTS = 20
 MAX_HISTORY = 5
@@ -58,18 +53,31 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
+# Twelve Data client (if key provided)
+td = None
+if TWELVE_DATA_API_KEY:
+    try:
+        from twelvedata import TDClient
+        td = TDClient(apikey=TWELVE_DATA_API_KEY)
+        log.info("✅ Twelve Data client initialized for accurate metal spot prices")
+    except ImportError:
+        log.warning("twelvedata package not installed. Install with: pip install twelvedata")
+    except Exception as e:
+        log.warning(f"Twelve Data init error: {e}")
+
 # ========== COMMODITIES ==========
+# Base configuration for all commodities
 COMMODITIES = {
-    "WTI":      {"symbol": "CL=F",     "name": "WTI Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
-    "BRENT":    {"symbol": "BZ=F",     "name": "Brent Crude Oil", "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
-    "NATGAS":   {"symbol": "NG=F",     "name": "Natural Gas",     "unit": "USD/MMBtu", "emoji": "🔥",  "group": "energy"},
-    "GOLD":     {"symbol": "XAUUSD=X", "name": "Gold",            "unit": "USD/oz",    "emoji": "🥇",  "group": "metals"},
-    "SILVER":   {"symbol": "XAGUSD=X", "name": "Silver",          "unit": "USD/oz",    "emoji": "🥈",  "group": "metals"},
-    "COPPER":   {"symbol": "XCUUSD=X", "name": "Copper",          "unit": "USD/lb",    "emoji": "🔶",  "group": "metals"},
-    "PLATINUM": {"symbol": "XPTUSD=X", "name": "Platinum",        "unit": "USD/oz",    "emoji": "⚪",  "group": "metals"},
-    "WHEAT":    {"symbol": "ZW=F",     "name": "Wheat",           "unit": "USc/bu",    "emoji": "🌾",  "group": "agri"},
-    "CORN":     {"symbol": "ZC=F",     "name": "Corn",            "unit": "USc/bu",    "emoji": "🌽",  "group": "agri"},
-    "SOY":      {"symbol": "ZS=F",     "name": "Soybeans",        "unit": "USc/bu",    "emoji": "🫘",  "group": "agri"},
+    "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy", "source": "yf"},
+    "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy", "source": "yf"},
+    "NATGAS":   {"symbol": "NG=F",  "name": "Natural Gas",      "unit": "USD/MMBtu", "emoji": "🔥",  "group": "energy", "source": "yf"},
+    "GOLD":     {"symbol": "XAU/USD", "name": "Gold",           "unit": "USD/oz",    "emoji": "🥇",  "group": "metals", "source": "td", "fallback": "GC=F"},
+    "SILVER":   {"symbol": "XAG/USD", "name": "Silver",         "unit": "USD/oz",    "emoji": "🥈",  "group": "metals", "source": "td", "fallback": "SI=F"},
+    "COPPER":   {"symbol": "XCU/USD", "name": "Copper",         "unit": "USD/lb",    "emoji": "🔶",  "group": "metals", "source": "td", "fallback": "HG=F"},
+    "PLATINUM": {"symbol": "XPT/USD", "name": "Platinum",       "unit": "USD/oz",    "emoji": "⚪",  "group": "metals", "source": "td", "fallback": "PL=F"},
+    "WHEAT":    {"symbol": "ZW=F",  "name": "Wheat",            "unit": "USc/bu",    "emoji": "🌾",  "group": "agri",   "source": "yf"},
+    "CORN":     {"symbol": "ZC=F",  "name": "Corn",             "unit": "USc/bu",    "emoji": "🌽",  "group": "agri",   "source": "yf"},
+    "SOY":      {"symbol": "ZS=F",  "name": "Soybeans",         "unit": "USc/bu",    "emoji": "🫘",  "group": "agri",   "source": "yf"},
 }
 
 GROUPS = {
@@ -106,7 +114,7 @@ TIMEFRAMES = {
     "1Y":  ("1y",  "1wk"),
 }
 
-# ========== DATABASE with schema upgrade ==========
+# ========== DATABASE ==========
 db_path = "data/commodity.db"
 db_lock = threading.RLock()
 conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -123,20 +131,16 @@ def db_query(sql, params=(), fetch_one=False, fetch_all=False):
             rows = cur.fetchall(); conn.commit(); return rows
         conn.commit(); return cur.lastrowid
 
-# Create profiles table with is_admin column (if not exists)
 db_query("""CREATE TABLE IF NOT EXISTS profiles (
     user_id INTEGER PRIMARY KEY,
     join_date INTEGER, username TEXT, first_name TEXT,
     is_admin INTEGER DEFAULT 0
 )""")
-
-# Add is_admin column to existing table if missing (schema upgrade)
 try:
     db_query("ALTER TABLE profiles ADD COLUMN is_admin INTEGER DEFAULT 0")
 except sqlite3.OperationalError:
-    pass  # column already exists
+    pass
 
-# Create alerts table
 db_query("""CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER, chat_id INTEGER,
@@ -145,7 +149,6 @@ db_query("""CREATE TABLE IF NOT EXISTS alerts (
 )""")
 
 def init_admins():
-    """Mark users from ADMIN_IDS as admin in the database."""
     for uid in ADMIN_IDS:
         db_query("UPDATE profiles SET is_admin=1 WHERE user_id=?", (uid,))
 init_admins()
@@ -242,14 +245,14 @@ def back_button():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-# ========== PRICE & HISTORY FETCHING ==========
+# ========== PRICE FETCHING (HYBRID) ==========
 def _flatten(df):
     if df is None: return None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
     return df
 
-def _download(symbol, period, interval):
+def _download_yf(symbol, period, interval):
     try:
         df = yf.Ticker(symbol).history(period=period, interval=interval)
         if df is not None and not df.empty:
@@ -267,25 +270,65 @@ def _download(symbol, period, interval):
                 return df
     except Exception as e:
         log.warning(f"yf.download failed {symbol}: {e}")
-    log.error(f"No data: {symbol} {period}/{interval}")
+    return None
+
+def get_price_td(symbol):
+    if td is None:
+        return None
+    try:
+        ts = td.time_series(symbol=symbol, interval="1min", outputsize=1)
+        df = ts.with_pandas()
+        if df is not None and not df.empty:
+            return float(df['close'].iloc[-1])
+    except Exception as e:
+        log.warning(f"Twelve Data error for {symbol}: {e}")
     return None
 
 def get_price(key):
     ck = f"px_{key}"
     cached = cache.get(ck)
-    if cached: return cached
+    if cached:
+        return cached
 
-    sym = COMMODITIES[key]["symbol"]
-    df = _download(sym, "5d", "1d")
-    if df is None or df.empty: return None
+    comm = COMMODITIES[key]
+    price = None
+    prev = None
 
-    close = df["Close"].dropna()
-    if len(close) < 1: return None
+    if comm["source"] == "td" and td is not None:
+        price = get_price_td(comm["symbol"])
+        if price is not None:
+            # Get previous close for change percent (2 data points)
+            try:
+                ts2 = td.time_series(symbol=comm["symbol"], interval="1day", outputsize=2)
+                df2 = ts2.with_pandas()
+                if df2 is not None and len(df2) >= 2:
+                    prev = float(df2['close'].iloc[-2])
+                else:
+                    prev = price
+            except:
+                prev = price
+        else:
+            # Fallback to yfinance futures
+            log.info(f"Twelve Data failed for {comm['name']}, using fallback {comm['fallback']}")
+            df = _download_yf(comm["fallback"], "5d", "1d")
+            if df is not None and not df.empty:
+                close = df["Close"].dropna()
+                if len(close) >= 1:
+                    price = float(close.iloc[-1])
+                    prev = float(close.iloc[-2]) if len(close) >= 2 else price
+    else:
+        # Energy & agriculture: use yfinance
+        df = _download_yf(comm["symbol"], "5d", "1d")
+        if df is not None and not df.empty:
+            close = df["Close"].dropna()
+            if len(close) >= 1:
+                price = float(close.iloc[-1])
+                prev = float(close.iloc[-2]) if len(close) >= 2 else price
 
-    price = float(close.iloc[-1])
-    prev = float(close.iloc[-2]) if len(close) >= 2 else price
-    change = ((price - prev) / prev * 100) if prev else 0.0
+    if price is None:
+        return None
 
+    change = ((price - prev) / prev * 100) if prev and prev != 0 else 0.0
     result = {"price": price, "change": change, "prev": prev}
     cache.set(ck, result, ttl=PRICE_TTL)
     return result
@@ -294,8 +337,10 @@ def get_history(key, period="1mo", interval="1d"):
     ck = f"hist_{key}_{period}_{interval}"
     cached = cache.get(ck)
     if cached is not None: return cached
-    sym = COMMODITIES[key]["symbol"]
-    df = _download(sym, period, interval)
+    comm = COMMODITIES[key]
+    # Use yfinance for history (consistent, as Twelve Data free tier has limited history)
+    yf_sym = comm.get("fallback", comm["symbol"])
+    df = _download_yf(yf_sym, period, interval)
     if df is not None and not df.empty:
         cache.set(ck, df, ttl=HIST_TTL)
     return df
@@ -331,7 +376,7 @@ def fetch_news(key, max_items=6):
                 "language": "en",
                 "sortBy": "publishedAt",
                 "pageSize": max_items,
-                "from": (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")
+                "from": (datetime.now(timezone.UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
             }
             response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
@@ -391,7 +436,7 @@ def headline_emoji(title):
     elif s < -0.2: return "🔴"
     return "⚪"
 
-# ========== TECHNICAL ANALYSIS ==========
+# ========== TECHNICAL ANALYSIS (unchanged) ==========
 def compute_ta(df):
     if df is None or len(df) < 20: return None
     close = df["Close"].squeeze().dropna()
@@ -566,7 +611,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax1.plot(x, bb_up_v, color=BLUE, linewidth=0.7, linestyle="--", alpha=0.6, label="BB±2σ")
     ax1.plot(x, bb_lo_v, color=BLUE, linewidth=0.7, linestyle="--", alpha=0.6)
 
-    # Current price line + label
     ax1.axhline(y=last_price, color="cyan", linestyle="-.", linewidth=1.5, alpha=0.8, label=f"Current: {fmt_price(last_price)}")
     ax1.text(n-1, last_price, f" {fmt_price(last_price)}", color="cyan", fontsize=9, va="bottom", ha="left")
 
@@ -603,7 +647,7 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax3.set_xticks(ticks)
     ax3.set_xticklabels(labels, rotation=25, ha="right", fontsize=7, color=MUTED)
 
-    fig.text(0.99, 0.01, "Commodity Oracle  |  Data: Yahoo Finance",
+    fig.text(0.99, 0.01, "Commodity Oracle  |  Data: Yahoo Finance + Twelve Data",
              color=MUTED, fontsize=7, ha="right", va="bottom")
 
     plt.tight_layout(pad=0.8)
@@ -757,7 +801,7 @@ def build_prices_text():
             else:
                 lines.append(f"⚪ {c['emoji']} <b>{c['name']}</b>  —  N/A")
         lines.append("")
-    lines.append(f"<i>🕐 {datetime.utcnow().strftime('%H:%M UTC')}</i>")
+    lines.append(f"<i>🕐 {datetime.now(timezone.UTC).strftime('%H:%M UTC')}</i>")
     return "\n".join(lines)
 
 # ========== COMMAND HANDLERS ==========
@@ -1171,7 +1215,7 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Commodity Oracle Bot started — metals spot tickers, 1D chart (30m), current price on chart, enhanced profile & stats")
+log.info("🚀 Commodity Oracle Bot started — Hybrid: Twelve Data spot (accurate) + yfinance fallback for metals")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
