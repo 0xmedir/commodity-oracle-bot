@@ -57,7 +57,7 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
-# ========== COMMODITIES – ALL YFINANCE FUTURES ==========
+# ========== COMMODITIES – ALL YFINANCE FUTURES (RELIABLE) ==========
 COMMODITIES = {
     "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
     "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
@@ -183,18 +183,18 @@ def delete_msg(m):
     except: pass
 
 def safe_send(cid, text, markup=None):
-    """Send message with retries and aggressive fallback to plain text + tag stripping."""
-    # First try with HTML
+    """Robust send with HTML stripping fallback and retries."""
+    # First attempt with HTML
     for attempt in range(3):
         try:
             return bot.send_message(cid, text, reply_markup=markup,
                                     disable_web_page_preview=True, parse_mode="HTML")
         except ApiTelegramException as e:
             if "can't parse entities" in str(e):
-                # Strip any remaining HTML tags
+                # Strip HTML tags
                 clean_text = re.sub(r'<[^>]+>', '', text)
                 if attempt == 2:
-                    # Last attempt: send without any markup
+                    # Last resort: plain text
                     try:
                         return bot.send_message(cid, clean_text, reply_markup=markup,
                                                 disable_web_page_preview=True, parse_mode=None)
@@ -202,7 +202,7 @@ def safe_send(cid, text, markup=None):
                         log.error(f"send error (plain) {cid}: {e2}")
                         return None
                 else:
-                    # Try again with stripped text but still HTML mode? Better to fallback early.
+                    # Try again with stripped text but still HTML mode? Safer to fallback early
                     text = clean_text
                     continue
             elif "Too Many Requests" in str(e):
@@ -315,7 +315,7 @@ def get_history(key, period="1mo", interval="1d"):
         cache.set(ck, df, ttl=HIST_TTL)
     return df
 
-# ========== NEWS & SENTIMENT (unchanged, but titles are already escaped) ==========
+# ========== NEWS & SENTIMENT (unchanged) ==========
 def fetch_news(key, max_items=6):
     ck = f"news_{key}"
     cached = cache.get(ck)
@@ -406,7 +406,7 @@ def headline_emoji(title):
     elif s < -0.2: return "🔴"
     return "⚪"
 
-# ========== TECHNICAL ANALYSIS (unchanged) ==========
+# ========== TECHNICAL ANALYSIS ==========
 def compute_ta(df):
     if df is None or len(df) < 20: return None
     close = df["Close"].squeeze().dropna()
@@ -1031,10 +1031,16 @@ def cb_sig(call):
             return
         cid = call.message.chat.id
         loading = send_and_track(cid, f"⏳ Analyzing {key}…", back_button())
+        log.info(f"Signal requested for {key} by user {call.from_user.id}")
+
         def analyze():
             try:
                 df = get_history(key, "3mo", "1d")
+                if df is None or df.empty:
+                    raise ValueError(f"No historical data for {key}")
                 ta = compute_ta(df)
+                if ta is None:
+                    raise ValueError(f"TA calculation failed for {key} (insufficient data)")
                 articles = fetch_news(key)
                 s_sc, s_lbl = sentiment_score(articles)
                 signal, reasons, score = generate_signal(ta, s_sc)
@@ -1043,6 +1049,7 @@ def cb_sig(call):
                 price_str = f"{fmt_price(price_data['price'])} {c['unit']}" if price_data else "N/A"
                 chg_str = (f"  ({'+' if price_data['change']>=0 else ''}{price_data['change']:.2f}%)"
                            if price_data else "")
+                # Build message with HTML – safe_send will handle errors
                 text = f"🎯 <b>{c['emoji']} {c['name']} — Trading Signal</b>\n\n"
                 text += f"💵 Price: <b>{price_str}</b>{chg_str}\n"
                 text += f"📊 Signal: <b>{signal}</b>  (score: {score:+d})\n\n"
@@ -1069,6 +1076,7 @@ def cb_sig(call):
                 text += "<b>── Signal Breakdown ──</b>\n"
                 text += "\n".join(reasons[:7])
                 text += "\n\n⚠️ <i>Not financial advice. DYOR.</i>"
+
                 if loading:
                     try: bot.delete_message(cid, loading.message_id)
                     except: pass
@@ -1079,15 +1087,17 @@ def cb_sig(call):
                 )
                 kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
                 send_and_track(cid, text, kb)
+                log.info(f"Signal sent successfully for {key}")
             except Exception as e:
-                log.error(f"Error in analyze thread: {e}")
+                log.error(f"Error in signal analysis for {key}: {e}", exc_info=True)
                 if loading:
                     try: bot.delete_message(cid, loading.message_id)
                     except: pass
                 safe_send(cid, "❌ Error generating signal. Try again later.", back_button())
+
         threading.Thread(target=analyze, daemon=True).start()
     except Exception as e:
-        log.error(f"Error in cb_sig: {e}")
+        log.error(f"Error in cb_sig: {e}", exc_info=True)
         bot.answer_callback_query(call.id, "Error", show_alert=False)
 
 @bot.callback_query_handler(func=lambda c: c.data == "alm")
@@ -1223,7 +1233,7 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Commodity Oracle Bot started — final version with retries and HTML stripping")
+log.info("🚀 Commodity Oracle Bot started — final version with signal fix and robust send")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
