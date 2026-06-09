@@ -183,21 +183,38 @@ def delete_msg(m):
     except: pass
 
 def safe_send(cid, text, markup=None):
-    try:
-        return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True, parse_mode="HTML")
-    except ApiTelegramException as e:
-        if "can't parse entities" in str(e):
-            try:
-                return bot.send_message(cid, text, reply_markup=markup, disable_web_page_preview=True, parse_mode=None)
-            except Exception as e2:
-                log.error(f"send error (plain) {cid}: {e2}")
+    """Send message with retries and aggressive fallback to plain text + tag stripping."""
+    # First try with HTML
+    for attempt in range(3):
+        try:
+            return bot.send_message(cid, text, reply_markup=markup,
+                                    disable_web_page_preview=True, parse_mode="HTML")
+        except ApiTelegramException as e:
+            if "can't parse entities" in str(e):
+                # Strip any remaining HTML tags
+                clean_text = re.sub(r'<[^>]+>', '', text)
+                if attempt == 2:
+                    # Last attempt: send without any markup
+                    try:
+                        return bot.send_message(cid, clean_text, reply_markup=markup,
+                                                disable_web_page_preview=True, parse_mode=None)
+                    except Exception as e2:
+                        log.error(f"send error (plain) {cid}: {e2}")
+                        return None
+                else:
+                    # Try again with stripped text but still HTML mode? Better to fallback early.
+                    text = clean_text
+                    continue
+            elif "Too Many Requests" in str(e):
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                log.error(f"send error {cid}: {e}")
                 return None
-        else:
-            log.error(f"send error {cid}: {e}")
-            return None
-    except Exception as e:
-        log.error(f"send error: {e}")
-        return None
+        except Exception as e:
+            log.error(f"send error: {e}")
+            time.sleep(1)
+    return None
 
 def safe_edit(cid, mid, text, markup=None):
     try:
@@ -240,7 +257,6 @@ def _flatten(df):
 def _download_yf(symbol, period, interval):
     def download():
         try:
-            # Use yf.download with threads=False and auto_adjust to avoid SQLite locks
             df = yf.download(symbol, period=period, interval=interval,
                              progress=False, auto_adjust=True, threads=False)
             if df is not None and not df.empty:
@@ -299,7 +315,7 @@ def get_history(key, period="1mo", interval="1d"):
         cache.set(ck, df, ttl=HIST_TTL)
     return df
 
-# ========== NEWS & SENTIMENT ==========
+# ========== NEWS & SENTIMENT (unchanged, but titles are already escaped) ==========
 def fetch_news(key, max_items=6):
     ck = f"news_{key}"
     cached = cache.get(ck)
@@ -390,7 +406,7 @@ def headline_emoji(title):
     elif s < -0.2: return "🔴"
     return "⚪"
 
-# ========== TECHNICAL ANALYSIS ==========
+# ========== TECHNICAL ANALYSIS (unchanged) ==========
 def compute_ta(df):
     if df is None or len(df) < 20: return None
     close = df["Close"].squeeze().dropna()
@@ -856,9 +872,8 @@ def _send_prices(cid):
     loading = send_and_track(cid, "⏳ Fetching live prices…", back_button())
 
     def fetch():
-        # Sequential fetch with individual timeouts; global timeout handled below
         for key in COMMODITIES:
-            get_price(key)  # each has 10s timeout internally
+            get_price(key)
         text = build_prices_text()
         kb = InlineKeyboardMarkup()
         kb.row(
@@ -870,14 +885,14 @@ def _send_prices(cid):
             except: pass
         send_and_track(cid, text, kb)
 
-    # Run with a global 25-second timeout
+    # Global timeout 25 sec
     fetch_thread = threading.Thread(target=fetch)
     fetch_thread.daemon = True
     fetch_thread.start()
     fetch_thread.join(timeout=25)
     if fetch_thread.is_alive():
-        log.error("Price fetch timed out overall")
-        text = build_prices_text()  # use whatever is cached
+        log.error("Price fetch timed out")
+        text = build_prices_text()
         kb = InlineKeyboardMarkup()
         kb.row(
             InlineKeyboardButton("🔄 Refresh", callback_data="px"),
@@ -1208,7 +1223,7 @@ def stop(sig, frame):
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Commodity Oracle Bot started — price fetch fixed (timeouts + cache fix)")
+log.info("🚀 Commodity Oracle Bot started — final version with retries and HTML stripping")
 bot.delete_webhook()
 time.sleep(1)
-bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+bot.infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
