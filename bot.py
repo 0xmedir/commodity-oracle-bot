@@ -1223,17 +1223,85 @@ def text_handler(m):
                 f"✅ Alert set!\n{c['emoji']} <b>{c['name']}</b> {direction} <b>${target:,.2f}</b>",
                 back_button())
 
-# ========== SHUTDOWN ==========
+# ========= SHUTDOWN =========
 def stop(sig, frame):
-    log.info("Shutting down…")
-    try: bot.stop_polling()
-    except: pass
-    sys.exit(0)
+    ... (existing code)
 
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-log.info("🚀 Commodity Oracle Bot started — final version with signal fix and robust send")
-bot.delete_webhook()
+# ========= ADD FLASK API FOR DASHBOARD HERE =========
+try:
+    from flask import Flask, jsonify
+    from flask_cors import CORS
+    import threading
+
+    flask_app = Flask(__name__)
+    CORS(flask_app)
+
+    @flask_app.route('/api/prices')
+    def api_prices():
+        result = {}
+        for key in COMMODITIES:
+            data = get_price(key)
+            if data:
+                result[key] = {"price": data["price"], "change": data["change"], "changePercent": data["change"]}
+            else:
+                result[key] = {"price": None, "change": 0, "changePercent": 0}
+        return jsonify(result)
+
+    @flask_app.route('/api/history/<symbol>')
+    def api_history(symbol):
+        df = get_history(symbol, "1mo", "1d")
+        if df is None or df.empty:
+            return jsonify([])
+        records = []
+        for idx, row in df.iterrows():
+            records.append({
+                "time": int(idx.timestamp() * 1000),
+                "open": float(row['Open']),
+                "high": float(row['High']),
+                "low": float(row['Low']),
+                "close": float(row['Close'])
+            })
+        return jsonify(records)
+
+    @flask_app.route('/api/signal/<symbol>')
+    def api_signal(symbol):
+        df = get_history(symbol, "3mo", "1d")
+        if df is None or df.empty:
+            return jsonify({"signal": "HOLD", "strength": 0, "reason": "No data"})
+        ta = compute_ta(df)
+        articles = fetch_news(symbol)
+        avg, _ = sentiment_score(articles)
+        sig, reasons, score = generate_signal(ta, avg)
+        return jsonify({
+            "signal": sig.replace("🟢", "").replace("🔴", "").strip(),
+            "strength": abs(score) * 20,
+            "reason": reasons[0] if reasons else "No reason"
+        })
+
+    @flask_app.route('/api/news/<symbol>')
+    def api_news(symbol):
+        articles = fetch_news(symbol, 6)
+        return jsonify([{"title": a["title"], "url": a["link"], "source": "NewsAPI", "date": a.get("published", "")} for a in articles])
+
+    @flask_app.route('/api/sentiment/<symbol>')
+    def api_sentiment(symbol):
+        articles = fetch_news(symbol)
+        avg, label = sentiment_score(articles)
+        return jsonify({"score": int((avg + 1) * 50), "label": label.replace("🟢", "").replace("🔴", "").strip()})
+
+    def run_flask():
+        flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    print("🌐 HTTP API running on http://localhost:5000")
+except ImportError:
+    print("⚠️ Flask not installed. Run: pip install flask flask-cors")
+
+# ========= ORIGINAL BOT START CODE =========
+log_info("Commodity Oracle Bot started - final version with signal fix and restart...")
+bot_delete_webhook()
 time.sleep(1)
-bot.infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
+bot_infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
