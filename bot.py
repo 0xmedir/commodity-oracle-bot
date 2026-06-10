@@ -25,9 +25,10 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 import concurrent.futures
 
-# Fix yfinance cache issues
-os.makedirs("/tmp/yfinance_cache", exist_ok=True)
-yf.set_tz_cache_location("/tmp/yfinance_cache")
+# Fix cache directory for Termux
+cache_dir = os.path.join(os.path.dirname(__file__), "yfinance_cache")
+os.makedirs(cache_dir, exist_ok=True)
+yf.set_tz_cache_location(cache_dir)
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -57,7 +58,7 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
-# ========== COMMODITIES – ALL YFINANCE FUTURES (RELIABLE) ==========
+# ========== COMMODITIES – ALL YFINANCE FUTURES ==========
 COMMODITIES = {
     "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
     "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
@@ -183,18 +184,14 @@ def delete_msg(m):
     except: pass
 
 def safe_send(cid, text, markup=None):
-    """Robust send with HTML stripping fallback and retries."""
-    # First attempt with HTML
     for attempt in range(3):
         try:
             return bot.send_message(cid, text, reply_markup=markup,
                                     disable_web_page_preview=True, parse_mode="HTML")
         except ApiTelegramException as e:
             if "can't parse entities" in str(e):
-                # Strip HTML tags
                 clean_text = re.sub(r'<[^>]+>', '', text)
                 if attempt == 2:
-                    # Last resort: plain text
                     try:
                         return bot.send_message(cid, clean_text, reply_markup=markup,
                                                 disable_web_page_preview=True, parse_mode=None)
@@ -202,7 +199,6 @@ def safe_send(cid, text, markup=None):
                         log.error(f"send error (plain) {cid}: {e2}")
                         return None
                 else:
-                    # Try again with stripped text but still HTML mode? Safer to fallback early
                     text = clean_text
                     continue
             elif "Too Many Requests" in str(e):
@@ -247,7 +243,7 @@ def back_button():
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
     return kb
 
-# ========== PRICE FETCHING (SAFE, WITH TIMEOUTS) ==========
+# ========== PRICE FETCHING ==========
 def _flatten(df):
     if df is None: return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -287,20 +283,16 @@ def get_price(key):
     cached = cache.get(ck)
     if cached:
         return cached
-
     sym = COMMODITIES[key]["symbol"]
     df = _download_yf(sym, "5d", "1d")
     if df is None or df.empty:
         return None
-
     close = df["Close"].dropna()
     if len(close) < 1:
         return None
-
     price = float(close.iloc[-1])
     prev = float(close.iloc[-2]) if len(close) >= 2 else price
     change = ((price - prev) / prev * 100) if prev else 0.0
-
     result = {"price": price, "change": change, "prev": prev}
     cache.set(ck, result, ttl=PRICE_TTL)
     return result
@@ -315,13 +307,12 @@ def get_history(key, period="1mo", interval="1d"):
         cache.set(ck, df, ttl=HIST_TTL)
     return df
 
-# ========== NEWS & SENTIMENT (unchanged) ==========
+# ========== NEWS & SENTIMENT ==========
 def fetch_news(key, max_items=6):
     ck = f"news_{key}"
     cached = cache.get(ck)
     if cached is not None:
         return cached
-
     query_map = {
         "WTI": "crude oil WTI",
         "BRENT": "Brent crude oil",
@@ -336,7 +327,6 @@ def fetch_news(key, max_items=6):
     }
     query = query_map.get(key, COMMODITIES[key]["name"])
     articles = []
-
     if NEWS_API_KEY:
         try:
             url = "https://newsapi.org/v2/everything"
@@ -362,7 +352,6 @@ def fetch_news(key, max_items=6):
                 log.warning(f"NewsAPI error: {response.status_code}")
         except Exception as e:
             log.warning(f"NewsAPI exception: {e}")
-
     if not articles:
         keywords = KEYWORDS.get(key, [])
         for url in RSS_FEEDS:
@@ -386,7 +375,6 @@ def fetch_news(key, max_items=6):
                             break
             except Exception as e:
                 log.warning(f"RSS fallback error {url}: {e}")
-
     cache.set(ck, articles, ttl=NEWS_TTL)
     return articles
 
@@ -411,30 +399,25 @@ def compute_ta(df):
     if df is None or len(df) < 20: return None
     close = df["Close"].squeeze().dropna()
     if len(close) < 20: return None
-
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     rsi = (100 - 100 / (1 + rs)).dropna()
-
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     sig = macd.ewm(span=9, adjust=False).mean()
     hist = macd - sig
-
     bb_mid = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
     bb_up = bb_mid + 2 * bb_std
     bb_lo = bb_mid - 2 * bb_std
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean() if len(close) >= 50 else None
-
     recent = close.tail(20)
     support = float(recent.min())
     resistance = float(recent.max())
-
     return {
         "rsi": float(rsi.iloc[-1]) if len(rsi) else 50.0,
         "macd": float(macd.iloc[-1]),
@@ -454,7 +437,6 @@ def generate_signal(ta, sentiment=0.0):
     if not ta:
         return "⚪ HOLD", ["Insufficient data for analysis."], 0
     score = 0; reasons = []
-
     rsi = ta["rsi"]
     if rsi < 30:
         score += 2; reasons.append(f"✅ RSI {rsi:.1f} — oversold (bullish)")
@@ -462,14 +444,12 @@ def generate_signal(ta, sentiment=0.0):
         score -= 2; reasons.append(f"🔴 RSI {rsi:.1f} — overbought (bearish)")
     else:
         reasons.append(f"⚪ RSI {rsi:.1f} — neutral zone")
-
     if ta["macd_hist"] > 0:
         score += 1; reasons.append("✅ MACD bullish crossover")
     elif ta["macd_hist"] < 0:
         score -= 1; reasons.append("🔴 MACD bearish crossover")
     else:
         reasons.append("⚪ MACD neutral")
-
     cl = ta["close"]
     if cl <= ta["bb_lo"]:
         score += 1; reasons.append("✅ Price at lower Bollinger Band — buy zone")
@@ -477,13 +457,11 @@ def generate_signal(ta, sentiment=0.0):
         score -= 1; reasons.append("🔴 Price at upper Bollinger Band — sell zone")
     else:
         reasons.append("⚪ Price inside Bollinger Bands — neutral")
-
     if ta["ema50"]:
         if ta["ema20"] > ta["ema50"]:
             score += 1; reasons.append("✅ EMA20 > EMA50 — uptrend")
         else:
             score -= 1; reasons.append("🔴 EMA20 < EMA50 — downtrend")
-
     sr = ta["resistance"] - ta["support"]
     if sr > 0:
         pos = (cl - ta["support"]) / sr
@@ -493,23 +471,20 @@ def generate_signal(ta, sentiment=0.0):
             score -= 1; reasons.append(f"🔴 Near resistance ${ta['resistance']:.2f}")
         else:
             reasons.append(f"⚪ Mid-range S:${ta['support']:.2f} R:${ta['resistance']:.2f}")
-
     if sentiment > 0.2:
         score += 1; reasons.append(f"✅ News sentiment bullish ({sentiment:+.2f})")
     elif sentiment < -0.2:
         score -= 1; reasons.append(f"🔴 News sentiment bearish ({sentiment:+.2f})")
     else:
         reasons.append(f"⚪ News sentiment neutral ({sentiment:+.2f})")
-
     if score >= 3: sig = "🟢 STRONG BUY"
     elif score >= 1: sig = "🟡 BUY"
     elif score <= -3: sig = "🔴 STRONG SELL"
     elif score <= -1: sig = "🟠 SELL"
     else: sig = "⚪ HOLD"
-
     return sig, reasons, score
 
-# ========== IMPROVED CHART GENERATION ==========
+# ========== CHART GENERATION ==========
 BG     = "#0a0e17"
 GRID   = "#1e2433"
 TEXT   = "#f0f3f8"
@@ -532,18 +507,15 @@ def generate_chart(key, period="1mo", interval="1d"):
     df = get_history(key, period, interval)
     if df is None or df.empty or len(df) < 5:
         return None
-
     c = COMMODITIES[key]
     cl = df["Close"].values.astype(float)
     op = df["Open"].values.astype(float) if "Open" in df.columns else cl.copy()
     hi = df["High"].values.astype(float) if "High" in df.columns else cl.copy()
     lo = df["Low"].values.astype(float) if "Low" in df.columns else cl.copy()
     vol = df["Volume"].values.astype(float) if "Volume" in df.columns else np.zeros(len(df))
-
     n = len(df)
     x = np.arange(n)
     up = cl >= op
-
     cs = pd.Series(cl)
     delta = cs.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
@@ -555,9 +527,7 @@ def generate_chart(key, period="1mo", interval="1d"):
     bb_std = cs.rolling(20).std()
     bb_up_v = (bb_mid + 2 * bb_std).values
     bb_lo_v = (bb_mid - 2 * bb_std).values
-
     last_price = cl[-1]
-
     fig = plt.figure(figsize=(14, 10), facecolor=BG, dpi=130)
     gs = fig.add_gridspec(3, 1, height_ratios=[4, 1, 2], hspace=0.08)
     ax1 = fig.add_subplot(gs[0])
@@ -565,7 +535,6 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax3 = fig.add_subplot(gs[2], sharex=ax1)
     for ax in [ax1, ax2, ax3]:
         _style_ax(ax)
-
     width = 0.55
     up_idx = np.where(up)[0]
     dn_idx = np.where(~up)[0]
@@ -575,28 +544,23 @@ def generate_chart(key, period="1mo", interval="1d"):
             color=RED, edgecolor=RED, width=width, linewidth=0, alpha=0.95)
     ax1.vlines(up_idx, lo[up_idx], hi[up_idx], color=GREEN, linewidth=1, alpha=0.9)
     ax1.vlines(dn_idx, lo[dn_idx], hi[dn_idx], color=RED, linewidth=1, alpha=0.9)
-
     ax1.plot(x, ema20, color=ORANGE, linewidth=1.5, label="EMA20", alpha=0.9)
     ax1.fill_between(x, bb_up_v, bb_lo_v, alpha=0.12, color=BLUE)
     ax1.plot(x, bb_up_v, color=BLUE, linewidth=1, linestyle="--", alpha=0.7, label="BB ±2σ")
     ax1.plot(x, bb_lo_v, color=BLUE, linewidth=1, linestyle="--", alpha=0.7)
-
     ax1.axhline(y=last_price, color="cyan", linestyle="-.", linewidth=1.8, alpha=0.9, label=f"Current: {fmt_price(last_price)}")
     ax1.text(n-1, last_price, f"  {fmt_price(last_price)}", color="cyan", fontsize=9, va="bottom", ha="left", weight='bold')
-
     ax1.set_title(f"{c['emoji']}  {c['name']} — {period}  ({interval} candles)  |  Last: {fmt_price(last_price)}",
                   color=TEXT, fontsize=14, pad=12)
     ax1.set_ylabel(c["unit"], color=MUTED, fontsize=10)
     ax1.legend(facecolor="#111827", labelcolor=TEXT, fontsize=9, loc="upper left", framealpha=0.8)
     ax1.tick_params(labelbottom=False)
-
     vol_c = np.where(up, GREEN, RED)
     ax2.bar(x, vol, color=vol_c, width=width*0.8, alpha=0.6)
     ax2.set_ylabel("Volume", color=MUTED, fontsize=9)
     ax2.tick_params(labelbottom=False)
     if vol.max() > 0:
         ax2.set_ylim(0, vol.max() * 1.3)
-
     ax3.plot(x, rsi_s, color=PURPLE, linewidth=1.5)
     ax3.axhline(70, color=RED, linewidth=1, linestyle="--", alpha=0.7)
     ax3.axhline(30, color=GREEN, linewidth=1, linestyle="--", alpha=0.7)
@@ -607,17 +571,14 @@ def generate_chart(key, period="1mo", interval="1d"):
     ax3.set_ylim(0, 100)
     last_rsi = float(rsi_s.dropna().iloc[-1]) if not rsi_s.dropna().empty else 50
     ax3.text(n-1, last_rsi+3, f"{last_rsi:.0f}", color=PURPLE, fontsize=9, ha="right", weight='bold')
-
     step = max(1, n // 8)
     ticks = list(range(0, n, step))
     fmt = "%b %y" if period == "1y" else "%m/%d"
     labels = [df.index[i].strftime(fmt) for i in ticks]
     ax3.set_xticks(ticks)
     ax3.set_xticklabels(labels, rotation=25, ha="right", fontsize=8, color=MUTED)
-
     fig.text(0.99, 0.01, "Commodity Oracle  |  Data: Yahoo Finance",
              color=MUTED, fontsize=8, ha="right", va="bottom")
-
     plt.tight_layout(pad=1.2)
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=BG)
@@ -870,7 +831,6 @@ def cb_px(call):
 
 def _send_prices(cid):
     loading = send_and_track(cid, "⏳ Fetching live prices…", back_button())
-
     def fetch():
         for key in COMMODITIES:
             get_price(key)
@@ -884,8 +844,6 @@ def _send_prices(cid):
             try: bot.delete_message(cid, loading.message_id)
             except: pass
         send_and_track(cid, text, kb)
-
-    # Global timeout 25 sec
     fetch_thread = threading.Thread(target=fetch)
     fetch_thread.daemon = True
     fetch_thread.start()
@@ -1032,7 +990,6 @@ def cb_sig(call):
         cid = call.message.chat.id
         loading = send_and_track(cid, f"⏳ Analyzing {key}…", back_button())
         log.info(f"Signal requested for {key} by user {call.from_user.id}")
-
         def analyze():
             try:
                 df = get_history(key, "3mo", "1d")
@@ -1049,7 +1006,6 @@ def cb_sig(call):
                 price_str = f"{fmt_price(price_data['price'])} {c['unit']}" if price_data else "N/A"
                 chg_str = (f"  ({'+' if price_data['change']>=0 else ''}{price_data['change']:.2f}%)"
                            if price_data else "")
-                # Build message with HTML – safe_send will handle errors
                 text = f"🎯 <b>{c['emoji']} {c['name']} — Trading Signal</b>\n\n"
                 text += f"💵 Price: <b>{price_str}</b>{chg_str}\n"
                 text += f"📊 Signal: <b>{signal}</b>  (score: {score:+d})\n\n"
@@ -1076,7 +1032,6 @@ def cb_sig(call):
                 text += "<b>── Signal Breakdown ──</b>\n"
                 text += "\n".join(reasons[:7])
                 text += "\n\n⚠️ <i>Not financial advice. DYOR.</i>"
-
                 if loading:
                     try: bot.delete_message(cid, loading.message_id)
                     except: pass
@@ -1094,7 +1049,6 @@ def cb_sig(call):
                     try: bot.delete_message(cid, loading.message_id)
                     except: pass
                 safe_send(cid, "❌ Error generating signal. Try again later.", back_button())
-
         threading.Thread(target=analyze, daemon=True).start()
     except Exception as e:
         log.error(f"Error in cb_sig: {e}", exc_info=True)
@@ -1205,7 +1159,6 @@ def text_handler(m):
         state = waiting.pop((cid, uid), None)
     if not state: return
     delete_msg(m)
-
     if state == "custom_alert":
         match = re.match(r"^(\w+)\s*([<>])\s*([\d.]+)$", (m.text or "").strip().upper())
         if not match:
@@ -1223,18 +1176,20 @@ def text_handler(m):
                 f"✅ Alert set!\n{c['emoji']} <b>{c['name']}</b> {direction} <b>${target:,.2f}</b>",
                 back_button())
 
-# ========= SHUTDOWN =========
+# ========== SHUTDOWN ==========
 def stop(sig, frame):
-    ... (existing code)
+    log.info("Shutting down…")
+    try: bot.stop_polling()
+    except: pass
+    sys.exit(0)
 
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
-# ========= ADD FLASK API FOR DASHBOARD HERE =========
+# ========== DASHBOARD HTTP API (runs alongside bot) ==========
 try:
-    from flask import Flask, jsonify
+    from flask import Flask, jsonify, request
     from flask_cors import CORS
-    import threading
 
     flask_app = Flask(__name__)
     CORS(flask_app)
@@ -1292,6 +1247,28 @@ try:
         avg, label = sentiment_score(articles)
         return jsonify({"score": int((avg + 1) * 50), "label": label.replace("🟢", "").replace("🔴", "").strip()})
 
+    # New endpoint to add alerts from web dashboard
+    @flask_app.route('/api/add_alert', methods=['POST'])
+    def api_add_alert():
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Missing JSON"}), 400
+        uid = data.get('user_id', 0)
+        cid = data.get('chat_id', 0)
+        commodity = data.get('commodity')
+        target = data.get('target')
+        direction = data.get('direction')
+        if not commodity or target is None or direction not in ['>', '<']:
+            return jsonify({"error": "Invalid parameters"}), 400
+        try:
+            target = float(target)
+        except:
+            return jsonify({"error": "Target must be a number"}), 400
+        aid, err = add_alert(uid, cid, commodity, target, direction)
+        if err:
+            return jsonify({"error": err}), 400
+        return jsonify({"message": "Alert added", "id": aid})
+
     def run_flask():
         flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
@@ -1300,8 +1277,8 @@ try:
 except ImportError:
     print("⚠️ Flask not installed. Run: pip install flask flask-cors")
 
-# ========= ORIGINAL BOT START CODE =========
-log_info("Commodity Oracle Bot started - final version with signal fix and restart...")
-bot_delete_webhook()
+# ========== START BOT ==========
+log.info("🚀 Commodity Oracle Bot started — final version with signal fix and robust send")
+bot.delete_webhook()
 time.sleep(1)
-bot_infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
+bot.infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
