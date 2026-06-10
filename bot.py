@@ -25,7 +25,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.apihelper import ApiTelegramException
 import concurrent.futures
 
-# Fix cache directory for Termux
+# Fix cache directory for Railway / tmp
 cache_dir = os.path.join(os.path.dirname(__file__), "yfinance_cache")
 os.makedirs(cache_dir, exist_ok=True)
 yf.set_tz_cache_location(cache_dir)
@@ -58,7 +58,7 @@ log = logging.getLogger("CommodityOracle")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
 os.makedirs("data", exist_ok=True)
 
-# ========== COMMODITIES – ALL YFINANCE FUTURES ==========
+# ========== COMMODITIES ==========
 COMMODITIES = {
     "WTI":      {"symbol": "CL=F",  "name": "WTI Crude Oil",   "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
     "BRENT":    {"symbol": "BZ=F",  "name": "Brent Crude Oil",  "unit": "USD/bbl",   "emoji": "🛢",  "group": "energy"},
@@ -1247,7 +1247,6 @@ try:
         avg, label = sentiment_score(articles)
         return jsonify({"score": int((avg + 1) * 50), "label": label.replace("🟢", "").replace("🔴", "").strip()})
 
-    # New endpoint to add alerts from web dashboard
     @flask_app.route('/api/add_alert', methods=['POST'])
     def api_add_alert():
         data = request.get_json()
@@ -1270,15 +1269,16 @@ try:
         return jsonify({"message": "Alert added", "id": aid})
 
     def run_flask():
-        flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+        port = int(os.environ.get("PORT", 5000))
+        flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
     threading.Thread(target=run_flask, daemon=True).start()
-    print("🌐 HTTP API running on http://localhost:5000")
+    print("🌐 HTTP API running on Railway port")
 except ImportError:
     print("⚠️ Flask not installed. Run: pip install flask flask-cors")
 
 # ========== START BOT ==========
-log.info("🚀 Commodity Oracle Bot started — final version with signal fix and robust send")
+log.info("🚀 Commodity Oracle Bot started — Railway version with API and alerts")
 bot.delete_webhook()
 time.sleep(1)
 bot.infinity_polling(timeout=120, long_polling_timeout=120, skip_pending=True)
