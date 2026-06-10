@@ -8,3 +8,5 @@ vaderSentiment
 flask
 flask-cors
 requests
+
+nano requirements.txt
